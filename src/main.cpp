@@ -64,7 +64,8 @@ extern PubSubClient mqttClient;
 // _buffer that the callback's `topic` pointer still references).
 static bool mqttCallbackActive = false;
 
-// Print to Serial and WebSerial only — raw debug output, never published to MQTT.
+// Print to Serial, WebSerial, and publish raw debug output to rainwater/debug.
+// This topic is consumed only by the Serial Monitor — never by the activity log.
 // wsLogf is the canonical debug sink; wsLog/wsLogln are thin wrappers around it.
 void wsLogf(const char* fmt, ...) {
     char buf[256];
@@ -74,6 +75,12 @@ void wsLogf(const char* fmt, ...) {
     va_end(args);
     Serial.print(buf);
     WebSerial.print(buf);
+    if (mqttCallbackActive) return;
+    // Strip trailing newline — MQTT carries one message per publish
+    size_t len = strlen(buf);
+    if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
+    if (len > 0 && mqttClient.connected())
+        mqttClient.publish("rainwater/debug", buf);
 }
 template<typename T>
 void wsLog(T msg) { wsLogf("%s", String(msg).c_str()); }
