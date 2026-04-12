@@ -159,7 +159,8 @@ QueuedCmd cmdQueue[CMD_QUEUE_SIZE];
 uint8_t   cmdQueueLen = 0;
 
 // ── Timing ────────────────────────────────────────────────────────────────────
-unsigned long lastPostMs = 0;
+unsigned long lastPostMs      = 0;
+unsigned long lastHeartbeatMs = 0;
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  WiFi
@@ -520,5 +521,11 @@ void loop()
     if ((now - lastPostMs) >= POST_INTERVAL_MS) {
         lastPostMs = now;
         publishSensorData();
+    }
+
+    // ── 5. Heartbeat — lets the dashboard know the ESP32 is alive ────────────
+    if ((now - lastHeartbeatMs) >= HEARTBEAT_INTERVAL_MS) {
+        lastHeartbeatMs = now;
+        postHttp("/api/heartbeat", "{\"source\":\"esp32\"}");
     }
 }

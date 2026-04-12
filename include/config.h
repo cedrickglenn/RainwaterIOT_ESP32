@@ -30,8 +30,9 @@
 #define OTA_HOSTNAME    "rainwater-esp32"
 
 // ── Timing ───────────────────────────────────────────────────────────────────
-#define POST_INTERVAL_MS     1000   // Publish sensor data every 1s
-#define WIFI_RETRY_DELAY_MS  500    // Delay between WiFi connection retries
-#define MQTT_RECONNECT_MS    5000   // Min interval between MQTT reconnect attempts
+#define POST_INTERVAL_MS        1000   // Publish sensor data every 1s
+#define HEARTBEAT_INTERVAL_MS  30000   // POST /api/heartbeat every 30s
+#define WIFI_RETRY_DELAY_MS     500    // Delay between WiFi connection retries
+#define MQTT_RECONNECT_MS      5000    // Min interval between MQTT reconnect attempts
 
 #endif // CONFIG_H
