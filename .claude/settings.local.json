@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ping -c 3 192.168.254.139)",
+      "Bash(ping -c 3 rainwater-esp32.local)",
+      "Bash(pio lib:*)",
+      "Bash(~/.platformio/penv/bin/pio lib:*)"
+    ]
+  }
+}
