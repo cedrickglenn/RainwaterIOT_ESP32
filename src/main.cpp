@@ -59,13 +59,13 @@ AsyncWebServer wsServer(80);
 // mqttClient is defined below; forward-declared here so wsLogf can reference it.
 extern PubSubClient mqttClient;
 
-// Guard: set true while inside the MQTT callback so wsLogf skips the
+// Guard: set true while inside the MQTT callback so mqttLog skips the
 // re-entrant publish (PubSubClient::publish() overwrites the same internal
 // _buffer that the callback's `topic` pointer still references).
 static bool mqttCallbackActive = false;
 
-// Print to Serial, WebSerial, and publish to rainwater/logs.
-// wsLogf is the canonical sink; wsLog/wsLogln are thin wrappers around it.
+// Print to Serial and WebSerial only — raw debug output, never published to MQTT.
+// wsLogf is the canonical debug sink; wsLog/wsLogln are thin wrappers around it.
 void wsLogf(const char* fmt, ...) {
     char buf[256];
     va_list args;
@@ -74,16 +74,23 @@ void wsLogf(const char* fmt, ...) {
     va_end(args);
     Serial.print(buf);
     WebSerial.print(buf);
-    if (mqttCallbackActive) return;   // never publish from within the callback
-    // Strip trailing newline — MQTT carries one message per publish
-    size_t len = strlen(buf);
-    if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
-    if (mqttClient.connected()) mqttClient.publish("rainwater/logs", buf);
 }
 template<typename T>
 void wsLog(T msg) { wsLogf("%s", String(msg).c_str()); }
 template<typename T>
 void wsLogln(T msg) { wsLogf("%s\n", String(msg).c_str()); }
+
+// Publish a structured log frame to rainwater/logs.
+// Format: "L,<LEVEL>,<CATEGORY>,<message>"
+// Only call this for meaningful events — not sensor data or debug noise.
+// Never call from within the MQTT callback (mqttCallbackActive guard).
+void mqttLog(const char* level, const char* category, const char* message) {
+    if (mqttCallbackActive) return;
+    if (!mqttClient.connected()) return;
+    char frame[220];
+    snprintf(frame, sizeof(frame), "L,%s,%s,%s", level, category, message);
+    mqttClient.publish("rainwater/logs", frame);
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  HTTP helpers — fire-and-forget POSTs to the Vercel backend
@@ -114,18 +121,6 @@ void postHttp(const char* path, const char* body)
     http.end();
 }
 
-// Post a structured activity log entry
-// raw format: "L,<LEVEL>,<CATEGORY>,<message>"  (mirrors Mega→ESP32 log protocol)
-void postActivity(const char* level, const char* category,
-                  const char* message, const char* source)
-{
-    char raw[220];
-    snprintf(raw, sizeof(raw), "L,%s,%s,[%s] %s", level, category, source, message);
-
-    char body[256];
-    snprintf(body, sizeof(body), "{\"raw\":\"%s\"}", raw);
-    postHttp("/api/activity", body);
-}
 
 // Post a raw ACK string
 void postAck(const String& raw)
@@ -183,11 +178,11 @@ void connectWiFi()
         wsLogln("");
         wsLog(F("[WiFi] Connected — IP: "));
         wsLogln(WiFi.localIP());
-        postActivity("INFO", "NETWORK", "WiFi connected", "esp32");
+        mqttLog("INFO", "NETWORK", "WiFi connected");
     } else {
         wsLogln("");
         wsLogln(F("[WiFi] FAILED — will retry in loop"));
-        postActivity("WARN", "NETWORK", "WiFi connect failed", "esp32");
+        mqttLog("WARN", "NETWORK", "WiFi connect failed");
     }
 }
 
@@ -245,7 +240,7 @@ void parseMegaLine(const String& line)
         message.trim();
 
         wsLogf("[Mega/%s] %s: %s\n", category.c_str(), level.c_str(), message.c_str());
-        postActivity(level.c_str(), category.c_str(), message.c_str(), "mega");
+        mqttLog(level.c_str(), category.c_str(), message.c_str());
         return;
     }
 
@@ -378,8 +373,7 @@ void drainCommandQueue()
     // Report each command that never received an ACK
     for (uint8_t i = acksReceived; i < count; i++) {
         wsLogf("[CMD] TIMEOUT — no ACK for: %s\n", cmdQueue[i].cmd.c_str());
-        postActivity("WARN", "COMMAND",
-                     (String("No ACK: ") + cmdQueue[i].cmd).c_str(), "esp32");
+        mqttLog("WARN", "COMMAND", (String("No ACK: ") + cmdQueue[i].cmd).c_str());
     }
 }
 
@@ -398,11 +392,11 @@ void reconnectMQTT()
         mqttClient.subscribe(MQTT_TOPIC_COMMANDS);
         mqttClient.subscribe(MQTT_TOPIC_CAL_COMMANDS);
         wsLogln(F("[MQTT] Subscribed to commands + calibration/commands"));
-        postActivity("INFO", "NETWORK", "MQTT connected", "esp32");
+        mqttLog("INFO", "NETWORK", "MQTT connected");
     } else {
         wsLogf("[MQTT] Failed, rc=%d — will retry in %ds\n",
                mqttClient.state(), MQTT_RECONNECT_MS / 1000);
-        postActivity("WARN", "NETWORK", "MQTT connect failed", "esp32");
+        mqttLog("WARN", "NETWORK", "MQTT connect failed");
     }
 }
 
@@ -459,16 +453,16 @@ void setup()
     ArduinoOTA.setMdnsEnabled(false);
     ArduinoOTA.onStart([]() {
         wsLogln(F("[OTA] Start"));
-        postActivity("INFO", "SYSTEM", "OTA update started", "esp32");
+        mqttLog("INFO", "SYSTEM", "OTA update started");
     });
     ArduinoOTA.onEnd([]() {
         wsLogln(F("[OTA] Done — rebooting"));
-        postActivity("INFO", "SYSTEM", "OTA update completed", "esp32");
+        mqttLog("INFO", "SYSTEM", "OTA update completed");
     });
     ArduinoOTA.onError([](ota_error_t error) {
         wsLog(F("[OTA] Error: "));
         wsLogln(error);
-        postActivity("ERROR", "SYSTEM", "OTA update failed", "esp32");
+        mqttLog("ERR", "SYSTEM", "OTA update failed");
     });
     ArduinoOTA.begin();
     wsLogln(F("[Init] OTA ready — hostname: " OTA_HOSTNAME));
@@ -483,7 +477,7 @@ void setup()
     wsLogln(F("=========================================================="));
     wsLogln(F("  ESP32 Ready"));
     wsLogln(F("=========================================================="));
-    postActivity("INFO", "SYSTEM", "ESP32 boot complete", "esp32");
+    mqttLog("INFO", "SYSTEM", "ESP32 boot complete");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -499,13 +493,13 @@ void loop()
     // ── 1. WiFi reconnect ────────────────────────────────────────────────────
     if (WiFi.status() != WL_CONNECTED) {
         wsLogln(F("[WiFi] Disconnected — reconnecting..."));
-        postActivity("WARN", "NETWORK", "WiFi disconnected", "esp32");
+        mqttLog("WARN", "NETWORK", "WiFi disconnected");
         connectWiFi();
     }
 
     // ── 2. MQTT loop + reconnect ─────────────────────────────────────────────
     if (!mqttClient.loop()) {
-        postActivity("WARN", "NETWORK", "MQTT disconnected", "esp32");
+        mqttLog("WARN", "NETWORK", "MQTT disconnected");
         reconnectMQTT();
     }
     drainCommandQueue();
