@@ -168,6 +168,12 @@ static void recordSeen(const String& cmd)
 unsigned long lastPostMs      = 0;
 unsigned long lastHeartbeatMs = 0;
 
+// ── Publish failure tracking ──────────────────────────────────────────────────
+// Counts consecutive publish failures. When it hits MQTT_PUBLISH_FAIL_MAX the
+// MQTT client is forcibly disconnected so reconnectMQTT() can open a fresh socket.
+// Resets to 0 on any successful publish.
+static uint8_t publishFailCount = 0;
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  WiFi
 // ═════════════════════════════════════════════════════════════════════════════
@@ -483,8 +489,15 @@ void publishSensorData()
 
     if (mqttClient.publish(MQTT_TOPIC_SENSORS, body)) {
         wsLogln(F("[MQTT] Sensors published"));
+        publishFailCount = 0;
     } else {
-        wsLogln(F("[MQTT] Sensor publish failed"));
+        publishFailCount++;
+        wsLogf("[MQTT] Sensor publish failed (%d/%d)\n", publishFailCount, MQTT_PUBLISH_FAIL_MAX);
+        if (publishFailCount >= MQTT_PUBLISH_FAIL_MAX) {
+            wsLogln(F("[MQTT] Forcing disconnect — dead socket detected"));
+            mqttClient.disconnect();
+            publishFailCount = 0;
+        }
     }
 }
 
@@ -514,6 +527,7 @@ void setup()
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
     mqttClient.setCallback(onMqttMessage);
     mqttClient.setBufferSize(1024);  // bumped from 512 — raw sensor fields added ~400 bytes to the payload
+    mqttClient.setKeepAlive(MQTT_KEEPALIVE_S);
     reconnectMQTT();
 
     // OTA

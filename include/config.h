@@ -30,5 +30,7 @@
 #define HEARTBEAT_INTERVAL_MS  30000   // POST /api/heartbeat every 30s
 #define WIFI_RETRY_DELAY_MS     500    // Delay between WiFi connection retries
 #define MQTT_RECONNECT_MS      5000    // Min interval between MQTT reconnect attempts
+#define MQTT_KEEPALIVE_S         20    // MQTT keep-alive interval in seconds (HiveMQ will ping ESP32 at 1.5× this)
+#define MQTT_PUBLISH_FAIL_MAX     3    // Force reconnect after this many consecutive publish failures
 
 #endif // CONFIG_H
