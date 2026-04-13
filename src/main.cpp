@@ -347,16 +347,32 @@ void drainCommandQueue()
         MegaSerial.println(cmdQueue[i].cmd);
     }
 
-    // Dynamic ACK drain — collect ACKs in order, exit when all received or 50ms elapsed
+    // Non-blocking ACK drain — read one char at a time so millis() is checked
+    // between every byte.  readStringUntil('\n') carries a 1-second stream
+    // timeout: if sensor data is mid-line in the RX buffer when we enter,
+    // that call can block and silently consume the entire drain window before
+    // the ACK even has a chance to be read.  Char-by-char reading avoids that.
+    // Late ACKs (e.g. pump ACKs delayed by the Mega's 100ms pump-start hold)
+    // are still forwarded by the unsolicited-ACK handler in parseMegaLine().
+    char          lineBuf[64];
+    uint8_t       lineLen      = 0;
     unsigned long drainUntil   = millis() + 50;
     uint8_t       acksReceived = 0;
 
     while (millis() < drainUntil && acksReceived < count) {
         if (!MegaSerial.available()) continue;
 
-        String line = MegaSerial.readStringUntil('\n');
-        line.trim();
-        if (line.length() == 0) continue;
+        char c = (char)MegaSerial.read();
+        if (c == '\r') continue;
+        if (c != '\n') {
+            if (lineLen < sizeof(lineBuf) - 1) lineBuf[lineLen++] = c;
+            continue;
+        }
+        // '\n' received — process completed line
+        if (lineLen == 0) continue;
+        lineBuf[lineLen] = '\0';
+        lineLen = 0;
+        String line = String(lineBuf);
 
         if (line.startsWith("A,")) {
             wsLogf("[CMD] ACK OK  (%s) → %s\n",
