@@ -531,7 +531,7 @@ void setup()
     // MQTT
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
     mqttClient.setCallback(onMqttMessage);
-    mqttClient.setBufferSize(512);
+    mqttClient.setBufferSize(1024);  // bumped from 512 — raw sensor fields added ~400 bytes to the payload
     reconnectMQTT();
 
     // OTA
