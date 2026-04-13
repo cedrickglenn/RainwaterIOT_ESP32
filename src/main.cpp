@@ -349,14 +349,19 @@ void drainCommandQueue()
 
     // Non-blocking ACK drain — read one char at a time so millis() is checked
     // between every byte.  readStringUntil('\n') carries a 1-second stream
-    // timeout: if sensor data is mid-line in the RX buffer when we enter,
-    // that call can block and silently consume the entire drain window before
-    // the ACK even has a chance to be read.  Char-by-char reading avoids that.
-    // Late ACKs (e.g. pump ACKs delayed by the Mega's 100ms pump-start hold)
-    // are still forwarded by the unsolicited-ACK handler in parseMegaLine().
+    // timeout that can silently consume the entire drain window; char-by-char
+    // reading avoids that.
+    //
+    // Window is 200ms (not 50ms) because the Mega's ultrasonic reads block
+    // ~25ms per sensor × 5 sensors = ~125ms before comms_receiveCommands()
+    // gets to run and send the ACK.  200ms comfortably covers that.
+    //
+    // OTA safety: this window only runs when cmdQueueLen > 0.  During an OTA
+    // flash no actuator commands are queued, so drainCommandQueue() returns
+    // immediately and OTA is never blocked.
     char          lineBuf[64];
     uint8_t       lineLen      = 0;
-    unsigned long drainUntil   = millis() + 50;
+    unsigned long drainUntil   = millis() + 200;
     uint8_t       acksReceived = 0;
 
     while (millis() < drainUntil && acksReceived < count) {
