@@ -387,10 +387,28 @@ void drainCommandQueue()
         }
     }
 
-    // Report each command that never received an ACK
+    // Report each command that never received an ACK within the drain window.
+    // Parse "C,VALVE,V1,OFF" → "Valve V1 OFF — no ACK (50 ms timeout)"
     for (uint8_t i = acksReceived; i < count; i++) {
-        wsLogf("[CMD] TIMEOUT — no ACK for: %s\n", cmdQueue[i].cmd.c_str());
-        mqttLog("WARN", "COMMAND", (String("No ACK: ") + cmdQueue[i].cmd).c_str());
+        const String& raw = cmdQueue[i].cmd;   // e.g. C,VALVE,V1,OFF
+        wsLogf("[CMD] TIMEOUT — no ACK for: %s\n", raw.c_str());
+
+        // Extract type / id / state from the command string
+        int c1 = raw.indexOf(',');             // after 'C'
+        int c2 = raw.indexOf(',', c1 + 1);     // after TYPE
+        int c3 = raw.indexOf(',', c2 + 1);     // after ID
+        if (c1 > 0 && c2 > 0 && c3 > 0) {
+            String type  = raw.substring(c1 + 1, c2);   // VALVE / PUMP
+            String id    = raw.substring(c2 + 1, c3);   // V1 / P1
+            String state = raw.substring(c3 + 1);        // ON / OFF
+            // Title-case the type for readability
+            type.toLowerCase();
+            if (type.length() > 0) type[0] = toupper(type[0]);
+            String msg = type + " " + id + " " + state + " — no ACK (50ms timeout)";
+            mqttLog("WARN", "COMMAND", msg.c_str());
+        } else {
+            mqttLog("WARN", "COMMAND", (String("No ACK: ") + raw).c_str());
+        }
     }
 }
 
