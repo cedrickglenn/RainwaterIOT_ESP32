@@ -49,7 +49,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
 #include <PubSubClient.h>
@@ -104,32 +103,15 @@ void mqttLog(const char* level, const char* category, const char* message) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  HTTP helpers — fire-and-forget POSTs to the Vercel backend
-//  WiFiClient is allocated on the stack; each call opens + closes its own
-//  connection (acceptable for low-frequency event/log posts).
+//  Heartbeat — publish to MQTT so the bridge can upsert device_heartbeats.
+//  Previously an HTTP POST to the Vercel backend; moved to MQTT so the ESP32
+//  has zero HTTP dependencies and works regardless of the deployment URL.
 // ═════════════════════════════════════════════════════════════════════════════
-void postHttp(const char* path, const char* body)
+void publishHeartbeat()
 {
-    if (WiFi.status() != WL_CONNECTED) return;
-
-    WiFiClientSecure httpTls;
-    httpTls.setInsecure();   // same trust policy as MQTT
-    HTTPClient http;
-
-    String url = String(API_BASE) + path;
-    if (!http.begin(httpTls, url)) {
-        wsLogf("[HTTP] begin() failed for %s\n", path);
-        return;
-    }
-    http.addHeader("Content-Type", "application/json");
-
-    int code = http.POST(body);
-    if (code > 0) {
-        wsLogf("[HTTP] POST %s → %d\n", path, code);
-    } else {
-        wsLogf("[HTTP] POST %s error: %s\n", path, http.errorToString(code).c_str());
-    }
-    http.end();
+    if (!mqttClient.connected()) return;
+    mqttClient.publish("rainwater/heartbeat", "{\"source\":\"esp32\"}", false);
+    wsLogln(F("[MQTT] Heartbeat published"));
 }
 
 
@@ -606,6 +588,6 @@ void loop()
     // ── 5. Heartbeat — lets the dashboard know the ESP32 is alive ────────────
     if ((now - lastHeartbeatMs) >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatMs = now;
-        postHttp("/api/heartbeat", "{\"source\":\"esp32\"}");
+        publishHeartbeat();
     }
 }

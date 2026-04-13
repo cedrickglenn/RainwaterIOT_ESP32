@@ -5,10 +5,6 @@
 #define WIFI_SSID       "GlobeAtHome_e9528"
 #define WIFI_PASSWORD   "K4QQ6DXr"
 
-// ── Backend API ─────────────────────────────────────────────────────────────
-// Vercel deployment base URL — no trailing slash.
-#define API_BASE        "https://rainwater-dashboard.vercel.app"
-
 // ── MQTT ─────────────────────────────────────────────────────────────────────
 #define MQTT_BROKER     "751cf20bd96c44afa0f25b4da8da918d.s1.eu.hivemq.cloud"   // ← replace
 #define MQTT_PORT       8883
