@@ -14,9 +14,13 @@
  *    ────────────                  ─────                         ────────────────
  *    Sensor data  →  Serial2  →  MQTT publish  →  rainwater/sensors          →  Backend → MongoDB
  *    Actuators    ←  Serial2  ←  MQTT subscribe ←  rainwater/commands         ←  Backend ← App
- *    ACKs         →  Serial2  →  MQTT publish  →  rainwater/acks             →  Backend
+ *    ACKs         →  Serial2  →  MQTT publish  →  rainwater/acks             →  mqtt-bridge.js → MongoDB
  *    Cal cmds     ←  Serial2  ←  MQTT subscribe ←  rainwater/calibration/commands ←  Backend ← App
- *    Cal ACKs     →  Serial2  →  MQTT publish  →  rainwater/calibration/acks →  Backend
+ *    Cal ACKs     →  Serial2  →  MQTT publish  →  rainwater/calibration/acks →  mqtt-bridge.js → MongoDB
+ *
+ *  NOTE: ACKs are written to MongoDB exclusively via the MQTT bridge (mqtt-bridge.js).
+ *  The ESP32 does NOT HTTP-POST ACKs directly — the bridge is the single writer,
+ *  eliminating the dual-write race on the actuator_states.confirmed field.
  *
  *  PROTOCOL (Mega → ESP32 over Serial2):
  *    Each line is:  "S,<KEY>,<VALUE>\n"
@@ -129,14 +133,6 @@ void postHttp(const char* path, const char* body)
 }
 
 
-// Post a raw ACK string
-void postAck(const String& raw)
-{
-    char body[128];
-    snprintf(body, sizeof(body), "{\"raw\":\"%s\"}", raw.c_str());
-    postHttp("/api/acks", body);
-}
-
 // ── MQTT ──────────────────────────────────────────────────────────────────────
 WiFiClientSecure secureClient;
 PubSubClient     mqttClient(secureClient);
@@ -199,8 +195,8 @@ void connectWiFi()
 //  Handled prefixes:
 //    S,KEY,VALUE          — sensor reading   → sensorDoc
 //    L,LEVEL,CATEGORY,MSG — log entry        → POST /api/activity (source: mega)
-//    A,<rest>             — ACK from Mega    → POST /api/acks + MQTT rainwater/acks
-//                           (CAL ACKs: A,CAL_* → rainwater/calibration/acks)
+//    A,<rest>             — ACK from Mega    → MQTT rainwater/acks → mqtt-bridge.js → MongoDB
+//                           (CAL ACKs: A,CAL_* → rainwater/calibration/acks → mqtt-bridge.js)
 //    C,<rest>             — command echo     → logged only (Mega echoes back commands)
 // ═════════════════════════════════════════════════════════════════════════════
 void parseMegaLine(const String& line)
@@ -253,13 +249,12 @@ void parseMegaLine(const String& line)
 
     // ── A, ACK frame  ────────────────────────────────────────────────────────
     // Format: A,VALVE,V1,OK  or  A,CAL_PH,C2,MID,OK,2.53
-    // ACKs that arrive here are unsolicited (outside a drainCommandQueue window).
-    // They are still POSTed to the HTTP endpoint and published to MQTT.
+    // ACKs that arrive here are unsolicited (outside a drainCommandQueue window,
+    // e.g. pump ACKs that arrive after the 50ms drain window due to the Mega's
+    // 100ms pump-start delay). Published to MQTT; the bridge writes MongoDB.
     if (line.startsWith("A,")) {
         wsLog(F("[Mega] ACK: "));
         wsLogln(line);
-
-        postAck(line);
 
         if (mqttClient.connected()) {
             const char* ackTopic = line.startsWith("A,CAL_")
@@ -370,7 +365,6 @@ void drainCommandQueue()
                                    ? MQTT_TOPIC_CAL_ACKS
                                    : MQTT_TOPIC_ACKS;
             mqttClient.publish(ackTopic, line.c_str());
-            postAck(line);
             acksReceived++;
         } else {
             parseMegaLine(line);
