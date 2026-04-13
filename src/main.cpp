@@ -142,7 +142,7 @@ unsigned long    lastMqttReconnectMs = 0;
 HardwareSerial MegaSerial(2);   // UART2 — GPIO16 (RX), GPIO17 (TX)
 
 // ── Sensor data store ─────────────────────────────────────────────────────────
-StaticJsonDocument<512> sensorDoc;
+StaticJsonDocument<1024> sensorDoc;
 bool sensorDataReady = false;
 
 // ── Pending MQTT commands from callback → loop() ──────────────────────────────
