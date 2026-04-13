@@ -398,22 +398,31 @@ void drainCommandQueue()
         const String& raw = cmdQueue[i].cmd;   // e.g. C,VALVE,V1,OFF
         wsLogf("[CMD] TIMEOUT — no ACK for: %s\n", raw.c_str());
 
-        // Extract type / id / state from the command string
+        // Extract type / id / state from the command string.
+        // Handles both:
+        //   3-part: C,VALVE,V1,OFF  → "Valve V1 OFF — no ACK (200ms timeout)"
+        //   2-part: C,ESTOP,ON      → "ESTOP ON — no ACK (200ms timeout)"
         int c1 = raw.indexOf(',');             // after 'C'
         int c2 = raw.indexOf(',', c1 + 1);     // after TYPE
-        int c3 = raw.indexOf(',', c2 + 1);     // after ID
+        int c3 = raw.indexOf(',', c2 + 1);     // after ID (absent for ESTOP)
+        String msg;
         if (c1 > 0 && c2 > 0 && c3 > 0) {
-            String type  = raw.substring(c1 + 1, c2);   // VALVE / PUMP
-            String id    = raw.substring(c2 + 1, c3);   // V1 / P1
-            String state = raw.substring(c3 + 1);        // ON / OFF
-            // Title-case the type for readability
+            // C,VALVE,V1,OFF or C,PUMP,P1,ON
+            String type  = raw.substring(c1 + 1, c2);
+            String id    = raw.substring(c2 + 1, c3);
+            String state = raw.substring(c3 + 1);
             type.toLowerCase();
             if (type.length() > 0) type[0] = toupper(type[0]);
-            String msg = type + " " + id + " " + state + " — no ACK (50ms timeout)";
-            mqttLog("WARN", "COMMAND", msg.c_str());
+            msg = type + " " + id + " " + state + " — no ACK (200ms timeout)";
+        } else if (c1 > 0 && c2 > 0) {
+            // C,ESTOP,ON  or other 2-part commands
+            String type  = raw.substring(c1 + 1, c2);
+            String state = raw.substring(c2 + 1);
+            msg = type + " " + state + " — no ACK (200ms timeout)";
         } else {
-            mqttLog("WARN", "COMMAND", (String("No ACK: ") + raw).c_str());
+            msg = String("No ACK: ") + raw;
         }
+        mqttLog("WARN", "COMMAND", msg.c_str());
     }
 }
 
