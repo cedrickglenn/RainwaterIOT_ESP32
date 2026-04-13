@@ -156,6 +156,32 @@ struct QueuedCmd {
 QueuedCmd cmdQueue[CMD_QUEUE_SIZE];
 uint8_t   cmdQueueLen = 0;
 
+// ── Recent-command dedup cache ────────────────────────────────────────────────
+// QoS-1 broker re-delivery can send the same command twice if a PUBACK is lost
+// during an MQTT reconnect. We reject any command that matches one seen within
+// the last DEDUP_WINDOW_MS to prevent double-execution on the Mega.
+#define DEDUP_SLOTS   4
+#define DEDUP_WINDOW_MS 3000
+struct DedupEntry { String cmd; unsigned long ts; };
+static DedupEntry dedupCache[DEDUP_SLOTS];
+static uint8_t    dedupHead = 0;   // ring-buffer write pointer
+
+static bool isDuplicate(const String& cmd)
+{
+    unsigned long now = millis();
+    for (uint8_t i = 0; i < DEDUP_SLOTS; i++) {
+        if (dedupCache[i].cmd == cmd && (now - dedupCache[i].ts) < DEDUP_WINDOW_MS)
+            return true;
+    }
+    return false;
+}
+
+static void recordSeen(const String& cmd)
+{
+    dedupCache[dedupHead] = { cmd, millis() };
+    dedupHead = (dedupHead + 1) % DEDUP_SLOTS;
+}
+
 // ── Timing ────────────────────────────────────────────────────────────────────
 unsigned long lastPostMs      = 0;
 unsigned long lastHeartbeatMs = 0;
@@ -287,6 +313,11 @@ void enqueuePayload(const char* buf, bool isCalibration)
         String raw = String(buf);
         raw.trim();
         if (raw.length() > 0 && cmdQueueLen < CMD_QUEUE_SIZE) {
+            if (isDuplicate(raw)) {
+                wsLogf("[CMD] Dedup — dropping duplicate: %s\n", raw.c_str());
+                return;
+            }
+            recordSeen(raw);
             cmdQueue[cmdQueueLen++] = { raw, isCalibration };
         }
         return;
@@ -298,7 +329,13 @@ void enqueuePayload(const char* buf, bool isCalibration)
     for (JsonVariant entry : cmds) {
         if (cmdQueueLen >= CMD_QUEUE_SIZE) break;
         String cmd = entry.as<String>();
-        if (cmd.length() > 0) cmdQueue[cmdQueueLen++] = { cmd, isCalibration };
+        if (cmd.length() == 0) continue;
+        if (isDuplicate(cmd)) {
+            wsLogf("[CMD] Dedup — dropping duplicate: %s\n", cmd.c_str());
+            continue;
+        }
+        recordSeen(cmd);
+        cmdQueue[cmdQueueLen++] = { cmd, isCalibration };
     }
 }
 
