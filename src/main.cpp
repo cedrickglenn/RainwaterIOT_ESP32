@@ -496,6 +496,8 @@ void publishSensorData()
         if (publishFailCount >= MQTT_PUBLISH_FAIL_MAX) {
             wsLogln(F("[MQTT] Forcing disconnect — dead socket detected"));
             mqttClient.disconnect();
+            secureClient.stop();        // fully tear down the TCP socket so the next connect() gets a clean one
+            lastMqttReconnectMs = 0;    // allow reconnectMQTT() to fire immediately on the next loop iteration
             publishFailCount = 0;
         }
     }
