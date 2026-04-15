@@ -174,6 +174,13 @@ unsigned long lastHeartbeatMs = 0;
 // Resets to 0 on any successful publish.
 static uint8_t publishFailCount = 0;
 
+// ── Reconnect failure tracking ────────────────────────────────────────────────
+// Counts consecutive mqttClient.connect() failures. When it hits
+// MQTT_RECONNECT_FAIL_MAX we force a full WiFi reconnect — this recycles the
+// ESP32's TCP stack and clears any lingering TIME_WAIT sockets that are causing
+// TCP_INVALID_SYN rejections at Railway's proxy.
+static uint8_t reconnectFailCount = 0;
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  WiFi
 // ═════════════════════════════════════════════════════════════════════════════
@@ -463,14 +470,31 @@ void reconnectMQTT()
     wsLogf("[MQTT] Connecting to %s...\n", MQTT_BROKER);
     if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
         wsLogln(F("[MQTT] Connected"));
+        reconnectFailCount = 0;
         mqttClient.subscribe(MQTT_TOPIC_COMMANDS);
         mqttClient.subscribe(MQTT_TOPIC_CAL_COMMANDS);
         wsLogln(F("[MQTT] Subscribed to commands + calibration/commands"));
         mqttLog("INFO", "NETWORK", "MQTT connected");
     } else {
-        wsLogf("[MQTT] Failed, rc=%d — will retry in %ds\n",
-               mqttClient.state(), MQTT_RECONNECT_MS / 1000);
+        reconnectFailCount++;
+        wsLogf("[MQTT] Failed, rc=%d (%d/%d) — will retry in %ds\n",
+               mqttClient.state(), reconnectFailCount, MQTT_RECONNECT_FAIL_MAX,
+               MQTT_RECONNECT_MS / 1000);
         mqttLog("WARN", "NETWORK", "MQTT connect failed");
+
+        // After MQTT_RECONNECT_FAIL_MAX consecutive failures, the ESP32's TCP
+        // stack likely has stale sockets that won't clear on their own.
+        // Reconnecting WiFi recycles the entire network interface and clears them.
+        if (reconnectFailCount >= MQTT_RECONNECT_FAIL_MAX) {
+            wsLogln(F("[MQTT] Too many failures — recycling WiFi to clear stale sockets"));
+            mqttLog("WARN", "NETWORK", "Recycling WiFi — stale TCP sockets");
+            reconnectFailCount = 0;
+            WiFi.disconnect(true);
+            delay(500);
+            connectWiFi();
+            // Reset cooldown so reconnect fires after WiFi comes back up
+            lastMqttReconnectMs = millis() - MQTT_RECONNECT_MS + MQTT_SOCKET_COOLDOWN_MS;
+        }
     }
 }
 
@@ -496,8 +520,11 @@ void publishSensorData()
         if (publishFailCount >= MQTT_PUBLISH_FAIL_MAX) {
             wsLogln(F("[MQTT] Forcing disconnect — dead socket detected"));
             mqttClient.disconnect();
-            secureClient.stop();        // fully tear down the TCP socket so the next connect() gets a clean one
-            lastMqttReconnectMs = 0;    // allow reconnectMQTT() to fire immediately on the next loop iteration
+            secureClient.stop();        // fully tear down the TCP socket
+            // Set lastMqttReconnectMs so reconnectMQTT() waits MQTT_SOCKET_COOLDOWN_MS
+            // before opening a new socket. This gives Railway's proxy time to clear
+            // the old connection from TIME_WAIT, preventing TCP_INVALID_SYN on reconnect.
+            lastMqttReconnectMs = millis() - MQTT_RECONNECT_MS + MQTT_SOCKET_COOLDOWN_MS;
             publishFailCount = 0;
         }
     }
