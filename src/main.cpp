@@ -515,6 +515,8 @@ void publishSensorData()
     if (mqttClient.publish(MQTT_TOPIC_SENSORS, body)) {
         wsLogln(F("[MQTT] Sensors published"));
         publishFailCount = 0;
+        sensorDataReady = false;
+        sensorDoc.clear();   // prevent accumulation across frames
     } else {
         publishFailCount++;
         wsLogf("[MQTT] Sensor publish failed (%d/%d)\n", publishFailCount, MQTT_PUBLISH_FAIL_MAX);
