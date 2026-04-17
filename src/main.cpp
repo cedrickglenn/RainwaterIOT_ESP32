@@ -509,7 +509,8 @@ void publishSensorData()
     sensorDoc["uptime_ms"] = millis();
 
     char body[1024];   // must match StaticJsonDocument size — raw fields added ~300 bytes
-    serializeJson(sensorDoc, body, sizeof(body));
+    size_t bodyLen = serializeJson(sensorDoc, body, sizeof(body));
+    wsLogf("[MQTT] Payload size: %u bytes (buffer: %u)\n", (unsigned)bodyLen, (unsigned)mqttClient.getBufferSize());
 
     if (mqttClient.publish(MQTT_TOPIC_SENSORS, body)) {
         wsLogln(F("[MQTT] Sensors published"));
