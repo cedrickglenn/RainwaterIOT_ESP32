@@ -67,6 +67,11 @@ extern PubSubClient mqttClient;
 // _buffer that the callback's `topic` pointer still references).
 static bool mqttCallbackActive = false;
 
+// Persistent line accumulator for Mega serial data. File-scope so
+// drainCommandQueue() can reset it after consuming bytes mid-stream.
+static char    megaLineBuf[128];
+static uint8_t megaLineLen = 0;
+
 
 // Print to Serial, WebSerial, and publish raw debug output to rainwater/debug.
 // This topic is consumed only by the Serial Monitor — never by the activity log.
@@ -633,6 +638,7 @@ void loop()
         reconnectMQTT();
     }
     drainCommandQueue();
+    megaLineLen = 0; // drain window consumed bytes mid-stream; discard any partial line
 
     // ── 2b. Deferred actuator publish — one loop after sensor publish ────────
     // Must run after mqttClient.loop() so PubSubClient's internal buffer is fully
@@ -648,8 +654,6 @@ void loop()
     // blocks up to setTimeout() ms mid-line, splitting long lines like
     // S,ACTUATORS across two reads and corrupting the next key in sensorDoc.
     {
-        static char    megaLineBuf[128];
-        static uint8_t megaLineLen = 0;
         while (MegaSerial.available()) {
             char c = (char)MegaSerial.read();
             if (c == '\r') continue;
