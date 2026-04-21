@@ -239,6 +239,13 @@ void parseMegaLine(const String& line)
             sensorDoc["filter_mode"]    = value.substring(s2, s3).toInt();
             sensorDoc["backwash_state"] = value.substring(s3 + 1).toInt();
             sensorDataReady = true;
+        } else if (key == "ACTUATORS") {
+            // Publish raw state string to its own topic — not a float, not in sensorDoc.
+            // Format: "V1:0,V2:1,...,P1:0,..."
+            // Bridge parses this and upserts actuator_states with confirmed:true.
+            if (mqttClient.connected()) {
+                mqttClient.publish("rainwater/actuators", value.c_str(), false);
+            }
         } else {
             sensorDoc[key] = value.toFloat();
         }
