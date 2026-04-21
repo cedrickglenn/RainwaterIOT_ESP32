@@ -125,7 +125,8 @@ HardwareSerial MegaSerial(2);   // UART2 — GPIO16 (RX), GPIO17 (TX)
 
 // ── Sensor data store ─────────────────────────────────────────────────────────
 StaticJsonDocument<1024> sensorDoc;
-bool sensorDataReady = false;
+bool   sensorDataReady  = false;
+String pendingActuators = "";   // latest S,ACTUATORS value — published alongside sensor data
 
 // ── Pending MQTT commands from callback → loop() ──────────────────────────────
 // PubSubClient must not publish/subscribe from within its own callback.
@@ -240,12 +241,12 @@ void parseMegaLine(const String& line)
             sensorDoc["backwash_state"] = value.substring(s3 + 1).toInt();
             sensorDataReady = true;
         } else if (key == "ACTUATORS") {
-            // Publish raw state string to its own topic — not a float, not in sensorDoc.
-            // Format: "V1:0,V2:1,...,P1:0,..."
-            // Bridge parses this and upserts actuator_states with confirmed:true.
-            if (mqttClient.connected()) {
-                mqttClient.publish("rainwater/actuators", value.c_str(), false);
-            }
+            // Store for publishing alongside sensor data — do NOT publish here.
+            // Calling mqttClient.publish() from inside parseMegaLine (which runs
+            // inside the serial read loop) can stall the loop long enough to miss
+            // the STATE line, which would prevent sensorDataReady from being set
+            // and silently stop all sensor publishes.
+            pendingActuators = value;
         } else {
             sensorDoc[key] = value.toFloat();
         }
@@ -524,6 +525,13 @@ void publishSensorData()
         publishFailCount = 0;
         sensorDataReady = false;
         sensorDoc.clear();   // prevent accumulation across frames
+
+        // Publish actuator states if we have a fresh snapshot from this frame.
+        // Done here (not in parseMegaLine) to keep the serial read loop unblocked.
+        if (pendingActuators.length() > 0) {
+            mqttClient.publish("rainwater/actuators", pendingActuators.c_str(), false);
+            pendingActuators = "";
+        }
     } else {
         publishFailCount++;
         wsLogf("[MQTT] Sensor publish failed (%d/%d)\n", publishFailCount, MQTT_PUBLISH_FAIL_MAX);
