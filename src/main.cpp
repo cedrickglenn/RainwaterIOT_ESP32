@@ -398,7 +398,7 @@ void drainCommandQueue()
     // OTA safety: this window only runs when cmdQueueLen > 0.  During an OTA
     // flash no actuator commands are queued, so drainCommandQueue() returns
     // immediately and OTA is never blocked.
-    char          lineBuf[64];
+    char          lineBuf[128];
     uint8_t       lineLen      = 0;
     unsigned long drainUntil   = millis() + 200;
     uint8_t       acksReceived = 0;
@@ -410,6 +410,7 @@ void drainCommandQueue()
         if (c == '\r') continue;
         if (c != '\n') {
             if (lineLen < sizeof(lineBuf) - 1) lineBuf[lineLen++] = c;
+            else                               lineLen = 0; // overflow — discard and start fresh
             continue;
         }
         // '\n' received — process completed line
