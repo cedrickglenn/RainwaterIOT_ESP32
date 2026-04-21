@@ -564,7 +564,6 @@ void setup()
 
     // Serial2 link to Arduino Mega
     MegaSerial.begin(MEGA_BAUD_RATE, SERIAL_8N1, MEGA_RX_PIN, MEGA_TX_PIN);
-    MegaSerial.setTimeout(50);   // readStringUntil('\n') gives up after 50ms instead of default 1000ms
     Serial.println(F("[Init] Serial2 (Mega link) started"));
 
     // WiFi
@@ -646,10 +645,28 @@ void loop()
     }
 
     // ── 3. Read sensor lines from Mega ───────────────────────────────────────
-    while (MegaSerial.available()) {
-        String line = MegaSerial.readStringUntil('\n');
-        line.trim();
-        if (line.length() > 0) parseMegaLine(line);
+    // Char-by-char with static buffer — avoids readStringUntil('\n') which
+    // blocks up to setTimeout() ms mid-line, splitting long lines like
+    // S,ACTUATORS across two reads and corrupting the next key in sensorDoc.
+    {
+        static char  megaLineBuf[128];
+        static uint8_t megaLineLen = 0;
+        while (MegaSerial.available()) {
+            char c = (char)MegaSerial.read();
+            if (c == '\r') continue;
+            if (c == '\n') {
+                if (megaLineLen > 0) {
+                    megaLineBuf[megaLineLen] = '\0';
+                    parseMegaLine(String(megaLineBuf));
+                    megaLineLen = 0;
+                }
+            } else {
+                if (megaLineLen < sizeof(megaLineBuf) - 1)
+                    megaLineBuf[megaLineLen++] = c;
+                else
+                    megaLineLen = 0; // overflow — discard malformed line
+            }
+        }
     }
 
     // ── 4. Publish sensor data ───────────────────────────────────────────────
