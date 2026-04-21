@@ -125,8 +125,9 @@ HardwareSerial MegaSerial(2);   // UART2 — GPIO16 (RX), GPIO17 (TX)
 
 // ── Sensor data store ─────────────────────────────────────────────────────────
 StaticJsonDocument<1024> sensorDoc;
-bool   sensorDataReady  = false;
-String pendingActuators = "";   // latest S,ACTUATORS value — published alongside sensor data
+bool   sensorDataReady    = false;
+String pendingActuators   = "";    // latest S,ACTUATORS value, buffered until after sensor publish
+bool   actuatorsReadyToSend = false; // true = sensor publish succeeded, send actuators next loop
 
 // ── Pending MQTT commands from callback → loop() ──────────────────────────────
 // PubSubClient must not publish/subscribe from within its own callback.
@@ -526,11 +527,12 @@ void publishSensorData()
         sensorDataReady = false;
         sensorDoc.clear();   // prevent accumulation across frames
 
-        // Publish actuator states if we have a fresh snapshot from this frame.
-        // Done here (not in parseMegaLine) to keep the serial read loop unblocked.
+        // Signal that actuator states should be published on the NEXT loop iteration,
+        // after mqttClient.loop() has run. PubSubClient uses a single internal buffer —
+        // calling publish() twice in one function corrupts the session and causes the
+        // next loop() to disconnect, which is the "one publish then silence" bug.
         if (pendingActuators.length() > 0) {
-            mqttClient.publish("rainwater/actuators", pendingActuators.c_str(), false);
-            pendingActuators = "";
+            actuatorsReadyToSend = true;
         }
     } else {
         publishFailCount++;
@@ -562,6 +564,7 @@ void setup()
 
     // Serial2 link to Arduino Mega
     MegaSerial.begin(MEGA_BAUD_RATE, SERIAL_8N1, MEGA_RX_PIN, MEGA_TX_PIN);
+    MegaSerial.setTimeout(50);   // readStringUntil('\n') gives up after 50ms instead of default 1000ms
     Serial.println(F("[Init] Serial2 (Mega link) started"));
 
     // WiFi
@@ -633,6 +636,15 @@ void loop()
     }
     drainCommandQueue();
 
+    // ── 2b. Deferred actuator publish — one loop after sensor publish ────────
+    // Must run after mqttClient.loop() so PubSubClient's internal buffer is fully
+    // flushed from the previous sensor publish before we write into it again.
+    if (actuatorsReadyToSend && mqttClient.connected()) {
+        mqttClient.publish("rainwater/actuators", pendingActuators.c_str(), false);
+        pendingActuators = "";
+        actuatorsReadyToSend = false;
+    }
+
     // ── 3. Read sensor lines from Mega ───────────────────────────────────────
     while (MegaSerial.available()) {
         String line = MegaSerial.readStringUntil('\n');
@@ -641,7 +653,11 @@ void loop()
     }
 
     // ── 4. Publish sensor data ───────────────────────────────────────────────
-    if ((now - lastPostMs) >= POST_INTERVAL_MS) {
+    // Publish as soon as STATE arrives (sensorDataReady=true) rather than on a
+    // fixed timer. The timer was causing frames to be overwritten before publish
+    // when the 1s poll fired after the next Mega frame had already started filling
+    // sensorDoc. Rate-limit to POST_INTERVAL_MS to avoid flooding the broker.
+    if (sensorDataReady && (now - lastPostMs) >= POST_INTERVAL_MS) {
         lastPostMs = now;
         publishSensorData();
     }
