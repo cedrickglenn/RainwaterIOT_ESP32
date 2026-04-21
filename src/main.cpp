@@ -67,11 +67,6 @@ extern PubSubClient mqttClient;
 // _buffer that the callback's `topic` pointer still references).
 static bool mqttCallbackActive = false;
 
-// Guard: set true while parsing Mega sensor lines so wsLogf skips the
-// rainwater/debug MQTT publish. Parsing 36+ lines/frame × 4 wsLog calls each
-// = 144 back-to-back publishes per 2s — enough to corrupt the PubSubClient
-// session and prevent sensor publishes from ever firing again.
-static bool megaParseActive = false;
 
 // Print to Serial, WebSerial, and publish raw debug output to rainwater/debug.
 // This topic is consumed only by the Serial Monitor — never by the activity log.
@@ -85,7 +80,6 @@ void wsLogf(const char* fmt, ...) {
     Serial.print(buf);
     WebSerial.print(buf);
     if (mqttCallbackActive) return;
-    if (megaParseActive) return;   // don't publish during sensor frame parsing
     // Strip trailing newline — MQTT carries one message per publish
     size_t len = strlen(buf);
     if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
@@ -652,12 +646,9 @@ void loop()
     // Char-by-char with static buffer — avoids readStringUntil('\n') which
     // blocks up to setTimeout() ms mid-line, splitting long lines like
     // S,ACTUATORS across two reads and corrupting the next key in sensorDoc.
-    // megaParseActive suppresses MQTT debug publishes during parsing —
-    // 36+ lines/frame × wsLog calls each = too many back-to-back publishes.
     {
         static char    megaLineBuf[128];
         static uint8_t megaLineLen = 0;
-        megaParseActive = true;
         while (MegaSerial.available()) {
             char c = (char)MegaSerial.read();
             if (c == '\r') continue;
@@ -674,7 +665,6 @@ void loop()
                     megaLineLen = 0; // overflow — discard malformed line
             }
         }
-        megaParseActive = false;
     }
 
     // ── 4. Publish sensor data ───────────────────────────────────────────────
