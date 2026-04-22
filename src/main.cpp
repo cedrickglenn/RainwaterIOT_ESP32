@@ -99,8 +99,8 @@ static char    megaLineBuf[128];
 static uint8_t megaLineLen = 0;
 
 // ── wsLogf — safe to call from either core ───────────────────────────────────
-// MQTT debug publish only fires from core 0 to prevent cross-core mqttClient
-// calls. Core 1 still gets Serial + WebSerial output.
+// Outputs to Serial + WebSerial immediately, then queues a rainwater/debug
+// publish via ackQueue (mutex-protected). drainAckQueue() publishes one per tick.
 void wsLogf(const char* fmt, ...) {
     char buf[256];
     va_list args;
@@ -110,13 +110,23 @@ void wsLogf(const char* fmt, ...) {
     Serial.print(buf);
     WebSerial.print(buf);
 
-    // Only publish to rainwater/debug from core 0 — mqttClient is not thread-safe.
-    if (xPortGetCoreID() != 0) return;
+    // Queue for rainwater/debug — safe from either core; drainAckQueue() publishes one per tick.
+    // This replaces the former direct mqttClient.publish() call which bypassed the queue and
+    // caused EMQX to receive all wsLogf lines as a single TCP burst (same-timestamp burst in serial monitor).
     if (mqttCallbackActive) return;
     size_t len = strlen(buf);
     if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
-    if (len > 0 && mqttClient.connected())
-        mqttClient.publish("rainwater/debug", buf);
+    if (len > 0) {
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        if (ackQueueLen < ACK_QUEUE_SIZE) {
+            strncpy(ackQueue[ackQueueLen].topic,   "rainwater/debug",  sizeof(ackQueue[0].topic) - 1);
+            strncpy(ackQueue[ackQueueLen].payload, buf,                sizeof(ackQueue[0].payload) - 1);
+            ackQueue[ackQueueLen].topic[sizeof(ackQueue[0].topic) - 1]   = '\0';
+            ackQueue[ackQueueLen].payload[sizeof(ackQueue[0].payload) - 1] = '\0';
+            ackQueueLen++;
+        }
+        xSemaphoreGive(dataMutex);
+    }
 }
 template<typename T>
 void wsLog(T msg) { wsLogf("%s", String(msg).c_str()); }
@@ -162,7 +172,7 @@ bool   actuatorsReadyToSend = false;
 // Core 1 pushes ACKs here instead of calling mqttClient.publish() directly.
 // Core 0 drains this queue after mqttClient.loop() returns.
 // Protected by dataMutex.
-#define ACK_QUEUE_SIZE 8
+#define ACK_QUEUE_SIZE 32
 struct QueuedAck {
     char    topic[64];
     char    payload[128];
@@ -282,9 +292,7 @@ void parseMegaLine(const String& line)
         }
         xSemaphoreGive(dataMutex);
 
-        // Do not publish individual S, key-value pairs to rainwater/debug —
-        // 18+ lines per telemetry cycle floods the queue and the serial monitor.
-        // The data is already collected into sensorDoc and published via publishSensorData().
+        wsLogf("[Mega] %s = %s\n", key.c_str(), value.c_str());
         return;
     }
 
