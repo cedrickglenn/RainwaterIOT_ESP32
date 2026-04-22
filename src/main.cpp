@@ -300,7 +300,7 @@ void parseMegaLine(const String& line)
             // via drainAckQueue(). One item per 2s cycle keeps the queue clear.
             // Format: "MEGA|KEY=VALUE|KEY=VALUE|...|STATE=0,1,0"
             // The MEGA prefix lets the dashboard detect and render this as a sensor table.
-            megaDebugBuf += "STATE=" + value;
+            megaDebugBuf += "|STATE=" + value;
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             if (ackQueueLen < ACK_QUEUE_SIZE) {
                 strncpy(ackQueue[ackQueueLen].topic,   "rainwater/debug",        sizeof(ackQueue[0].topic) - 1);
