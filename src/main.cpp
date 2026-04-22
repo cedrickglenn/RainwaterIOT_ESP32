@@ -298,7 +298,9 @@ void parseMegaLine(const String& line)
             // STATE is always the last line of the Mega telemetry cycle (comms.cpp).
             // Push the accumulated debug buffer as one queue item — Core 1 publishes it
             // via drainAckQueue(). One item per 2s cycle keeps the queue clear.
-            megaDebugBuf += "[Mega] STATE=" + value;
+            // Format: "MEGA|KEY=VALUE|KEY=VALUE|...|STATE=0,1,0"
+            // The MEGA prefix lets the dashboard detect and render this as a sensor table.
+            megaDebugBuf += "STATE=" + value;
             xSemaphoreTake(dataMutex, portMAX_DELAY);
             if (ackQueueLen < ACK_QUEUE_SIZE) {
                 strncpy(ackQueue[ackQueueLen].topic,   "rainwater/debug",        sizeof(ackQueue[0].topic) - 1);
@@ -310,7 +312,9 @@ void parseMegaLine(const String& line)
             xSemaphoreGive(dataMutex);
             megaDebugBuf = "";
         } else {
-            megaDebugBuf += "[Mega] " + key + "=" + value + "\n";
+            // Pipe-separated: "MEGA|KEY=VALUE|KEY=VALUE|..."
+            if (megaDebugBuf.length() == 0) megaDebugBuf = "MEGA";
+            megaDebugBuf += "|" + key + "=" + value;
         }
         return;
     }
