@@ -414,8 +414,15 @@ void drainCommandQueue()
         char c = (char)MegaSerial.read();
         if (c == '\r') continue;
         if (c != '\n') {
-            if (lineLen < sizeof(lineBuf) - 1) lineBuf[lineLen++] = c;
-            else                               lineLen = 0; // overflow — discard and start fresh
+            if (lineLen < sizeof(lineBuf) - 1) {
+                lineBuf[lineLen++] = c;
+            } else {
+                lineBuf[sizeof(lineBuf) - 1] = '\0';
+                char msg[80];
+                snprintf(msg, sizeof(msg), "drain RX overflow, discarding: %.40s...", lineBuf);
+                mqttLog("WARN", "SERIAL", msg);
+                lineLen = 0;
+            }
             continue;
         }
         // '\n' received — process completed line
@@ -566,9 +573,15 @@ void setup()
     Serial.println(F("  Booting..."));
     Serial.println(F("=========================================================="));
 
-    // Serial2 link to Arduino Mega
+    // Serial2 link to Arduino Mega.
+    // setRxBufferSize must be called before begin(). 1024 bytes = ~89ms at
+    // 115200 baud — enough headroom for a full telemetry frame (~390 bytes,
+    // ~34ms) while mqttClient.loop() runs TLS I/O, which can exceed 22ms
+    // (the 256-byte default buffer's capacity), causing bytes to be silently
+    // dropped and producing corrupted sensor lines on the ESP32 side.
+    MegaSerial.setRxBufferSize(1024);
     MegaSerial.begin(MEGA_BAUD_RATE, SERIAL_8N1, MEGA_RX_PIN, MEGA_TX_PIN);
-    Serial.println(F("[Init] Serial2 (Mega link) started"));
+    Serial.println(F("[Init] Serial2 (Mega link) started, RX buffer 1024 bytes"));
 
     // WiFi
     connectWiFi();
@@ -654,6 +667,21 @@ void loop()
     // blocks up to setTimeout() ms mid-line, splitting long lines like
     // S,ACTUATORS across two reads and corrupting the next key in sensorDoc.
     {
+        // Track RX buffer peak so we can spot buffer-pressure trends.
+        static size_t   rxPeak        = 0;
+        static uint32_t lastPeakLogMs = 0;
+
+        size_t avail = MegaSerial.available();
+        if (avail > rxPeak) rxPeak = avail;
+
+        // Log peak every 30 s so the WebSerial monitor shows buffer headroom
+        // without flooding the log. Harmless when the buffer never fills.
+        if ((now - lastPeakLogMs) >= 30000) {
+            lastPeakLogMs = now;
+            wsLogf("[Serial] RX peak in last 30s: %u bytes (buf 1024)\n", rxPeak);
+            rxPeak = 0;
+        }
+
         while (MegaSerial.available()) {
             char c = (char)MegaSerial.read();
             if (c == '\r') continue;
@@ -664,10 +692,19 @@ void loop()
                     megaLineLen = 0;
                 }
             } else {
-                if (megaLineLen < sizeof(megaLineBuf) - 1)
+                if (megaLineLen < sizeof(megaLineBuf) - 1) {
                     megaLineBuf[megaLineLen++] = c;
-                else
-                    megaLineLen = 0; // overflow — discard malformed line
+                } else {
+                    // Software line buffer full — the received line is longer
+                    // than 127 chars, which should never happen with the current
+                    // Mega protocol. Log once per occurrence so it surfaces in
+                    // the dashboard activity log.
+                    megaLineBuf[sizeof(megaLineBuf) - 1] = '\0';
+                    char msg[80];
+                    snprintf(msg, sizeof(msg), "RX line overflow, discarding: %.40s...", megaLineBuf);
+                    mqttLog("WARN", "SERIAL", msg);
+                    megaLineLen = 0;
+                }
             }
         }
     }
