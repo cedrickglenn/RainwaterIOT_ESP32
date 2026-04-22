@@ -22,6 +22,25 @@
  *  The ESP32 does NOT HTTP-POST ACKs directly — the bridge is the single writer,
  *  eliminating the dual-write race on the actuator_states.confirmed field.
  *
+ *  DUAL-CORE ARCHITECTURE:
+ *    Core 0 (serialTask) — serial RX from Mega only.
+ *      Reads bytes, assembles lines, calls parseMegaLine().
+ *      parseMegaLine() NEVER calls mqttClient directly — ACKs are pushed to
+ *      ackQueue under dataMutex so core 1 publishes them.
+ *
+ *    Core 1 (Arduino loop()) — all MQTT I/O and serial TX.
+ *      mqttClient.loop(), reconnect, publish sensors/actuators/heartbeat/ACKs,
+ *      drain incoming command queue to Mega via MegaSerial.println(), OTA.
+ *      Arduino framework runs loop() on core 1 by default.
+ *
+ *    dataMutex protects every shared variable between the two cores:
+ *      sensorDoc, sensorDataReady, pendingActuators, actuatorsReadyToSend,
+ *      ackQueue/ackQueueLen.
+ *
+ *    LOCK DISCIPLINE — always: take → touch shared state → release.
+ *    Never call mqttClient while holding dataMutex.
+ *    Never hold dataMutex across a yield or delay.
+ *
  *  PROTOCOL (Mega → ESP32 over Serial2):
  *    Each line is:  "S,<KEY>,<VALUE>\n"
  *    Examples:
@@ -67,15 +86,21 @@ extern PubSubClient mqttClient;
 // _buffer that the callback's `topic` pointer still references).
 static bool mqttCallbackActive = false;
 
-// Persistent line accumulator for Mega serial data. File-scope so
-// drainCommandQueue() can reset it after consuming bytes mid-stream.
+// ── Dual-core mutex ───────────────────────────────────────────────────────────
+// Protects all shared state between serialTask (core 1) and mqttTask (core 0).
+// LOCK DISCIPLINE: take → touch shared state → release.
+// Never call mqttClient while holding this mutex.
+// Never hold across yield() or delay().
+static SemaphoreHandle_t dataMutex = nullptr;
+
+// ── Serial line buffer — owned exclusively by serialTask (core 1) ─────────────
+// Never touched by core 0. No mutex needed for these.
 static char    megaLineBuf[128];
 static uint8_t megaLineLen = 0;
 
-
-// Print to Serial, WebSerial, and publish raw debug output to rainwater/debug.
-// This topic is consumed only by the Serial Monitor — never by the activity log.
-// wsLogf is the canonical debug sink; wsLog/wsLogln are thin wrappers around it.
+// ── wsLogf — safe to call from either core ───────────────────────────────────
+// MQTT debug publish only fires from core 0 to prevent cross-core mqttClient
+// calls. Core 1 still gets Serial + WebSerial output.
 void wsLogf(const char* fmt, ...) {
     char buf[256];
     va_list args;
@@ -84,8 +109,10 @@ void wsLogf(const char* fmt, ...) {
     va_end(args);
     Serial.print(buf);
     WebSerial.print(buf);
+
+    // Only publish to rainwater/debug from core 0 — mqttClient is not thread-safe.
+    if (xPortGetCoreID() != 0) return;
     if (mqttCallbackActive) return;
-    // Strip trailing newline — MQTT carries one message per publish
     size_t len = strlen(buf);
     if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
     if (len > 0 && mqttClient.connected())
@@ -97,10 +124,9 @@ template<typename T>
 void wsLogln(T msg) { wsLogf("%s\n", String(msg).c_str()); }
 
 // Publish a structured log frame to rainwater/logs.
-// Format: "L,<LEVEL>,<CATEGORY>,<message>"
-// Only call this for meaningful events — not sensor data or debug noise.
-// Never call from within the MQTT callback (mqttCallbackActive guard).
+// Only call from core 0 — mqttClient is not thread-safe.
 void mqttLog(const char* level, const char* category, const char* message) {
+    if (xPortGetCoreID() != 0) return;
     if (mqttCallbackActive) return;
     if (!mqttClient.connected()) return;
     char frame[220];
@@ -109,9 +135,7 @@ void mqttLog(const char* level, const char* category, const char* message) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  Heartbeat — publish to MQTT so the bridge can upsert device_heartbeats.
-//  Previously an HTTP POST to the Vercel backend; moved to MQTT so the ESP32
-//  has zero HTTP dependencies and works regardless of the deployment URL.
+//  Heartbeat
 // ═════════════════════════════════════════════════════════════════════════════
 void publishHeartbeat()
 {
@@ -119,7 +143,6 @@ void publishHeartbeat()
     mqttClient.publish("rainwater/heartbeat", "{\"source\":\"esp32\"}", false);
     wsLogln(F("[MQTT] Heartbeat published"));
 }
-
 
 // ── MQTT ──────────────────────────────────────────────────────────────────────
 WiFiClientSecure secureClient;
@@ -129,32 +152,40 @@ unsigned long    lastMqttReconnectMs = 0;
 // ── Serial2 link to Arduino Mega ─────────────────────────────────────────────
 HardwareSerial MegaSerial(2);   // UART2 — GPIO16 (RX), GPIO17 (TX)
 
-// ── Sensor data store ─────────────────────────────────────────────────────────
+// ── Shared sensor state — protected by dataMutex ─────────────────────────────
 StaticJsonDocument<1024> sensorDoc;
-bool   sensorDataReady    = false;
-String pendingActuators   = "";    // latest S,ACTUATORS value, buffered until after sensor publish
-bool   actuatorsReadyToSend = false; // true = sensor publish succeeded, send actuators next loop
+bool   sensorDataReady      = false;
+String pendingActuators     = "";
+bool   actuatorsReadyToSend = false;
 
-// ── Pending MQTT commands from callback → loop() ──────────────────────────────
-// PubSubClient must not publish/subscribe from within its own callback.
-// Commands are queued here and drained in loop() after mqttClient.loop() returns.
+// ── ACK queue — written by core 1 (parseMegaLine), drained by core 0 ─────────
+// Core 1 pushes ACKs here instead of calling mqttClient.publish() directly.
+// Core 0 drains this queue after mqttClient.loop() returns.
+// Protected by dataMutex.
+#define ACK_QUEUE_SIZE 8
+struct QueuedAck {
+    char    topic[64];
+    char    payload[128];
+};
+static QueuedAck ackQueue[ACK_QUEUE_SIZE];
+static uint8_t   ackQueueLen = 0;
+
+// ── Incoming command queue — written by MQTT callback (core 0), drained by core 0
+// No mutex needed — both sides run on core 0.
 #define CMD_QUEUE_SIZE 8
 struct QueuedCmd {
     String  cmd;
-    bool    isCalibration;   // true → ACK goes to rainwater/calibration/acks
+    bool    isCalibration;
 };
 QueuedCmd cmdQueue[CMD_QUEUE_SIZE];
 uint8_t   cmdQueueLen = 0;
 
 // ── Recent-command dedup cache ────────────────────────────────────────────────
-// QoS-1 broker re-delivery can send the same command twice if a PUBACK is lost
-// during an MQTT reconnect. We reject any command that matches one seen within
-// the last DEDUP_WINDOW_MS to prevent double-execution on the Mega.
 #define DEDUP_SLOTS   4
 #define DEDUP_WINDOW_MS 3000
 struct DedupEntry { String cmd; unsigned long ts; };
 static DedupEntry dedupCache[DEDUP_SLOTS];
-static uint8_t    dedupHead = 0;   // ring-buffer write pointer
+static uint8_t    dedupHead = 0;
 
 static bool isDuplicate(const String& cmd)
 {
@@ -177,16 +208,7 @@ unsigned long lastPostMs      = 0;
 unsigned long lastHeartbeatMs = 0;
 
 // ── Publish failure tracking ──────────────────────────────────────────────────
-// Counts consecutive publish failures. When it hits MQTT_PUBLISH_FAIL_MAX the
-// MQTT client is forcibly disconnected so reconnectMQTT() can open a fresh socket.
-// Resets to 0 on any successful publish.
-static uint8_t publishFailCount = 0;
-
-// ── Reconnect failure tracking ────────────────────────────────────────────────
-// Counts consecutive mqttClient.connect() failures. When it hits
-// MQTT_RECONNECT_FAIL_MAX we force a full WiFi reconnect — this recycles the
-// ESP32's TCP stack and clears any lingering TIME_WAIT sockets that are causing
-// TCP_INVALID_SYN rejections at Railway's proxy.
+static uint8_t publishFailCount  = 0;
 static uint8_t reconnectFailCount = 0;
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -219,14 +241,11 @@ void connectWiFi()
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  Parse a single frame line from the Mega
+//  Parse a single frame line from the Mega — runs on core 1 (serialTask)
 //
-//  Handled prefixes:
-//    S,KEY,VALUE          — sensor reading   → sensorDoc
-//    L,LEVEL,CATEGORY,MSG — log entry        → POST /api/activity (source: mega)
-//    A,<rest>             — ACK from Mega    → MQTT rainwater/acks → mqtt-bridge.js → MongoDB
-//                           (CAL ACKs: A,CAL_* → rainwater/calibration/acks → mqtt-bridge.js)
-//    C,<rest>             — command echo     → logged only (Mega echoes back commands)
+//  IMPORTANT: Never calls mqttClient directly.
+//  ACKs are pushed to ackQueue (under dataMutex) for core 0 to publish.
+//  sensorDoc writes are under dataMutex.
 // ═════════════════════════════════════════════════════════════════════════════
 void parseMegaLine(const String& line)
 {
@@ -240,6 +259,8 @@ void parseMegaLine(const String& line)
         String value = line.substring(secondComma + 1);
         value.trim();
 
+        // Take mutex only for the shared state write — release immediately after.
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
         if (key == "STATE") {
             sensorDoc["ff_state"]       = value.substring(0, value.indexOf(',')).toInt();
             int s2 = value.indexOf(',') + 1;
@@ -248,26 +269,22 @@ void parseMegaLine(const String& line)
             sensorDoc["backwash_state"] = value.substring(s3 + 1).toInt();
             sensorDataReady = true;
         } else if (key == "ACTUATORS") {
-            // Store for publishing alongside sensor data — do NOT publish here.
-            // Calling mqttClient.publish() from inside parseMegaLine (which runs
-            // inside the serial read loop) can stall the loop long enough to miss
-            // the STATE line, which would prevent sensorDataReady from being set
-            // and silently stop all sensor publishes.
             pendingActuators = value;
         } else {
             sensorDoc[key] = value.toFloat();
         }
+        xSemaphoreGive(dataMutex);
 
         wsLogf("[Mega] %s = %s\n", key.c_str(), value.c_str());
         return;
     }
 
-    // ── L, log frame  ────────────────────────────────────────────────────────
-    // Format: L,LEVEL,CATEGORY,message text (message may contain commas)
+    // ── L, log frame ─────────────────────────────────────────────────────────
+    // Log to serial/WebSerial only — mqttLog is core 0 only.
     if (line.startsWith("L,")) {
-        int c1 = line.indexOf(',');           // after 'L'
-        int c2 = line.indexOf(',', c1 + 1);   // after LEVEL
-        int c3 = line.indexOf(',', c2 + 1);   // after CATEGORY
+        int c1 = line.indexOf(',');
+        int c2 = line.indexOf(',', c1 + 1);
+        int c3 = line.indexOf(',', c2 + 1);
         if (c3 < 0) return;
 
         String level    = line.substring(c1 + 1, c2);
@@ -275,30 +292,49 @@ void parseMegaLine(const String& line)
         String message  = line.substring(c3 + 1);
         message.trim();
 
+        // wsLogf is safe from core 1 (skips MQTT publish, outputs Serial+WebSerial).
         wsLogf("[Mega/%s] %s: %s\n", category.c_str(), level.c_str(), message.c_str());
-        mqttLog(level.c_str(), category.c_str(), message.c_str());
+
+        // Queue a structured log publish for core 0.
+        // Reuse the ACK queue with the logs topic — same mechanism, same drain path.
+        char frame[220];
+        snprintf(frame, sizeof(frame), "L,%s,%s,%s", level.c_str(), category.c_str(), message.c_str());
+
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        if (ackQueueLen < ACK_QUEUE_SIZE) {
+            strncpy(ackQueue[ackQueueLen].topic,   "rainwater/logs", sizeof(ackQueue[0].topic) - 1);
+            strncpy(ackQueue[ackQueueLen].payload, frame,            sizeof(ackQueue[0].payload) - 1);
+            ackQueue[ackQueueLen].topic[sizeof(ackQueue[0].topic) - 1]     = '\0';
+            ackQueue[ackQueueLen].payload[sizeof(ackQueue[0].payload) - 1] = '\0';
+            ackQueueLen++;
+        }
+        xSemaphoreGive(dataMutex);
         return;
     }
 
-    // ── A, ACK frame  ────────────────────────────────────────────────────────
-    // Format: A,VALVE,V1,OK  or  A,CAL_PH,C2,MID,OK,2.53
-    // ACKs that arrive here are unsolicited (outside a drainCommandQueue window,
-    // e.g. pump ACKs that arrive after the 50ms drain window due to the Mega's
-    // 100ms pump-start delay). Published to MQTT; the bridge writes MongoDB.
+    // ── A, ACK frame ─────────────────────────────────────────────────────────
+    // Push to ackQueue — core 0 publishes it. Never call mqttClient here.
     if (line.startsWith("A,")) {
         wsLog(F("[Mega] ACK: "));
         wsLogln(line);
 
-        if (mqttClient.connected()) {
-            const char* ackTopic = line.startsWith("A,CAL_")
-                                   ? MQTT_TOPIC_CAL_ACKS
-                                   : MQTT_TOPIC_ACKS;
-            mqttClient.publish(ackTopic, line.c_str(), false);
+        const char* topic = line.startsWith("A,CAL_")
+                            ? MQTT_TOPIC_CAL_ACKS
+                            : MQTT_TOPIC_ACKS;
+
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        if (ackQueueLen < ACK_QUEUE_SIZE) {
+            strncpy(ackQueue[ackQueueLen].topic,   topic,           sizeof(ackQueue[0].topic) - 1);
+            strncpy(ackQueue[ackQueueLen].payload, line.c_str(),    sizeof(ackQueue[0].payload) - 1);
+            ackQueue[ackQueueLen].topic[sizeof(ackQueue[0].topic) - 1]     = '\0';
+            ackQueue[ackQueueLen].payload[sizeof(ackQueue[0].payload) - 1] = '\0';
+            ackQueueLen++;
         }
+        xSemaphoreGive(dataMutex);
         return;
     }
 
-    // ── C, command echo  ─────────────────────────────────────────────────────
+    // ── C, command echo ───────────────────────────────────────────────────────
     if (line.startsWith("C,")) {
         wsLog(F("[Mega] Echo: "));
         wsLogln(line);
@@ -307,8 +343,8 @@ void parseMegaLine(const String& line)
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  Enqueue commands from a raw payload string
-//  Handles both JSON array {"commands":[...]} and plain "C,..." strings
+//  Enqueue commands from a raw payload string — runs on core 0 (MQTT callback)
+//  No mutex needed — cmdQueue is only accessed on core 0.
 // ═════════════════════════════════════════════════════════════════════════════
 void enqueuePayload(const char* buf, bool isCalibration)
 {
@@ -316,7 +352,6 @@ void enqueuePayload(const char* buf, bool isCalibration)
     DeserializationError jsonErr = deserializeJson(doc, buf);
 
     if (jsonErr != DeserializationError::Ok) {
-        // Plain string command
         String raw = String(buf);
         raw.trim();
         if (raw.length() > 0 && cmdQueueLen < CMD_QUEUE_SIZE) {
@@ -347,14 +382,11 @@ void enqueuePayload(const char* buf, bool isCalibration)
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  MQTT — incoming message callback
+//  MQTT — incoming message callback — runs on core 0
 //  Only enqueues — no mqttClient publish/subscribe calls allowed here.
-//  NOTE: `topic` and `payload` point into PubSubClient's internal _buffer.
-//  Copy both to locals immediately before doing anything else.
 // ═════════════════════════════════════════════════════════════════════════════
 void onMqttMessage(char* topic, byte* payload, unsigned int length)
 {
-    // Copy topic — PubSubClient::publish() would overwrite _buffer (and topic)
     char topicBuf[64];
     strncpy(topicBuf, topic, sizeof(topicBuf) - 1);
     topicBuf[sizeof(topicBuf) - 1] = '\0';
@@ -375,34 +407,54 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length)
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  Drain command queue — called from loop() after mqttClient.loop() returns
-//  Blasts all queued commands to Mega, then collects ACKs dynamically
+//  Drain ACK queue — runs on core 0 after mqttClient.loop()
+//  Takes mutex to snapshot the queue, releases before publishing.
+//  Lock discipline: take → copy → release → publish (never publish under lock).
+// ═════════════════════════════════════════════════════════════════════════════
+void drainAckQueue()
+{
+    // Snapshot under lock — copy out so we don't hold mutex during publish.
+    QueuedAck  snapshot[ACK_QUEUE_SIZE];
+    uint8_t    count = 0;
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    count       = ackQueueLen;
+    memcpy(snapshot, ackQueue, sizeof(QueuedAck) * count);
+    ackQueueLen = 0;
+    xSemaphoreGive(dataMutex);
+    // Mutex released — safe to call mqttClient now.
+
+    if (!mqttClient.connected()) return;
+
+    for (uint8_t i = 0; i < count; i++) {
+        mqttClient.publish(snapshot[i].topic, snapshot[i].payload, false);
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Drain command queue — runs on core 0
+//  Sends commands to Mega via serial TX, collects ACKs within a drain window.
+//  Serial TX is core 0 only. Serial RX during the drain window is safe because
+//  serialTask (core 1) is still running and will process any bytes that arrive
+//  outside the drain window — the drain window only reads directly to collect
+//  ACKs that arrive synchronously in response to the commands just sent.
 // ═════════════════════════════════════════════════════════════════════════════
 void drainCommandQueue()
 {
     if (cmdQueueLen == 0) return;
 
     uint8_t count = cmdQueueLen;
-    cmdQueueLen = 0;  // clear before drain so re-entrant calls don't re-send
+    cmdQueueLen = 0;
 
-    // Blast all commands to Mega immediately
     for (uint8_t i = 0; i < count; i++) {
         wsLogf("[CMD] -> Mega: %s\n", cmdQueue[i].cmd.c_str());
         MegaSerial.println(cmdQueue[i].cmd);
     }
 
-    // Non-blocking ACK drain — read one char at a time so millis() is checked
-    // between every byte.  readStringUntil('\n') carries a 1-second stream
-    // timeout that can silently consume the entire drain window; char-by-char
-    // reading avoids that.
-    //
-    // Window is 200ms (not 50ms) because the Mega's ultrasonic reads block
-    // ~25ms per sensor × 5 sensors = ~125ms before comms_receiveCommands()
-    // gets to run and send the ACK.  200ms comfortably covers that.
-    //
-    // OTA safety: this window only runs when cmdQueueLen > 0.  During an OTA
-    // flash no actuator commands are queued, so drainCommandQueue() returns
-    // immediately and OTA is never blocked.
+    // 200ms ACK drain window — collect synchronous ACKs from Mega.
+    // Bytes read here are consumed from the hardware FIFO directly and will
+    // NOT be seen by serialTask. This is intentional — ACK lines belong to
+    // this command exchange, not to the sensor stream.
     char          lineBuf[128];
     uint8_t       lineLen      = 0;
     unsigned long drainUntil   = millis() + 200;
@@ -419,47 +471,42 @@ void drainCommandQueue()
             } else {
                 lineBuf[sizeof(lineBuf) - 1] = '\0';
                 char msg[80];
-                snprintf(msg, sizeof(msg), "drain RX overflow, discarding: %.40s...", lineBuf);
+                snprintf(msg, sizeof(msg), "drain RX overflow: %.40s...", lineBuf);
                 mqttLog("WARN", "SERIAL", msg);
                 lineLen = 0;
             }
             continue;
         }
-        // '\n' received — process completed line
         if (lineLen == 0) continue;
         lineBuf[lineLen] = '\0';
         lineLen = 0;
         String line = String(lineBuf);
 
         if (line.startsWith("A,")) {
-            wsLogf("[CMD] ACK OK  (%s) → %s\n",
-                   cmdQueue[acksReceived].cmd.c_str(), line.c_str());
+            wsLogf("[CMD] ACK (%s) → %s\n", cmdQueue[acksReceived].cmd.c_str(), line.c_str());
             const char* ackTopic = cmdQueue[acksReceived].isCalibration
                                    ? MQTT_TOPIC_CAL_ACKS
                                    : MQTT_TOPIC_ACKS;
-            mqttClient.publish(ackTopic, line.c_str());
+            if (mqttClient.connected())
+                mqttClient.publish(ackTopic, line.c_str());
             acksReceived++;
         } else {
+            // Non-ACK line received during drain window — parse it normally.
+            // parseMegaLine is safe to call from core 0 since it only touches
+            // shared state under dataMutex and never calls mqttClient.
             parseMegaLine(line);
         }
     }
 
-    // Report each command that never received an ACK within the drain window.
-    // Parse "C,VALVE,V1,OFF" → "Valve V1 OFF — no ACK (50 ms timeout)"
     for (uint8_t i = acksReceived; i < count; i++) {
-        const String& raw = cmdQueue[i].cmd;   // e.g. C,VALVE,V1,OFF
+        const String& raw = cmdQueue[i].cmd;
         wsLogf("[CMD] TIMEOUT — no ACK for: %s\n", raw.c_str());
 
-        // Extract type / id / state from the command string.
-        // Handles both:
-        //   3-part: C,VALVE,V1,OFF  → "Valve V1 OFF — no ACK (200ms timeout)"
-        //   2-part: C,ESTOP,ON      → "ESTOP ON — no ACK (200ms timeout)"
-        int c1 = raw.indexOf(',');             // after 'C'
-        int c2 = raw.indexOf(',', c1 + 1);     // after TYPE
-        int c3 = raw.indexOf(',', c2 + 1);     // after ID (absent for ESTOP)
+        int c1 = raw.indexOf(',');
+        int c2 = raw.indexOf(',', c1 + 1);
+        int c3 = raw.indexOf(',', c2 + 1);
         String msg;
         if (c1 > 0 && c2 > 0 && c3 > 0) {
-            // C,VALVE,V1,OFF or C,PUMP,P1,ON
             String type  = raw.substring(c1 + 1, c2);
             String id    = raw.substring(c2 + 1, c3);
             String state = raw.substring(c3 + 1);
@@ -467,7 +514,6 @@ void drainCommandQueue()
             if (type.length() > 0) type[0] = toupper(type[0]);
             msg = type + " " + id + " " + state + " — no ACK (200ms timeout)";
         } else if (c1 > 0 && c2 > 0) {
-            // C,ESTOP,ON  or other 2-part commands
             String type  = raw.substring(c1 + 1, c2);
             String state = raw.substring(c2 + 1);
             msg = type + " " + state + " — no ACK (200ms timeout)";
@@ -479,7 +525,7 @@ void drainCommandQueue()
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  MQTT — connect / reconnect (non-blocking, rate-limited)
+//  MQTT reconnect — core 0 only
 // ═════════════════════════════════════════════════════════════════════════════
 void reconnectMQTT()
 {
@@ -502,48 +548,60 @@ void reconnectMQTT()
                MQTT_RECONNECT_MS / 1000);
         mqttLog("WARN", "NETWORK", "MQTT connect failed");
 
-        // After MQTT_RECONNECT_FAIL_MAX consecutive failures, the ESP32's TCP
-        // stack likely has stale sockets that won't clear on their own.
-        // Reconnecting WiFi recycles the entire network interface and clears them.
         if (reconnectFailCount >= MQTT_RECONNECT_FAIL_MAX) {
-            wsLogln(F("[MQTT] Too many failures — recycling WiFi to clear stale sockets"));
+            wsLogln(F("[MQTT] Too many failures — recycling WiFi"));
             mqttLog("WARN", "NETWORK", "Recycling WiFi — stale TCP sockets");
             reconnectFailCount = 0;
             WiFi.disconnect(true);
             delay(500);
             connectWiFi();
-            // Reset cooldown so reconnect fires after WiFi comes back up
             lastMqttReconnectMs = millis() - MQTT_RECONNECT_MS + MQTT_SOCKET_COOLDOWN_MS;
         }
     }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  Publish sensor data to MQTT broker
+//  Publish sensor data — core 0 only
+//  Takes mutex to snapshot shared state, releases before publishing.
+//  Lock discipline: take → copy → release → publish.
 // ═════════════════════════════════════════════════════════════════════════════
 void publishSensorData()
 {
-    if (!sensorDataReady) return;
-    if (!mqttClient.connected()) return;
+    // Snapshot shared state under lock.
+    char   body[1024];
+    bool   hasActuators     = false;
+    String actuatorsSnapshot = "";
 
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (!sensorDataReady) {
+        xSemaphoreGive(dataMutex);
+        return;
+    }
     sensorDoc["uptime_ms"] = millis();
-
-    char body[1024];   // must match StaticJsonDocument size — raw fields added ~300 bytes
     size_t bodyLen = serializeJson(sensorDoc, body, sizeof(body));
     wsLogf("[MQTT] Payload size: %u bytes (buffer: %u)\n", (unsigned)bodyLen, (unsigned)mqttClient.getBufferSize());
+    sensorDataReady = false;
+    sensorDoc.clear();
+    if (pendingActuators.length() > 0) {
+        hasActuators      = true;
+        actuatorsSnapshot = pendingActuators;
+    }
+    xSemaphoreGive(dataMutex);
+    // Mutex released — safe to call mqttClient now.
+
+    if (!mqttClient.connected()) return;
 
     if (mqttClient.publish(MQTT_TOPIC_SENSORS, body)) {
         wsLogln(F("[MQTT] Sensors published"));
         publishFailCount = 0;
-        sensorDataReady = false;
-        sensorDoc.clear();   // prevent accumulation across frames
 
-        // Signal that actuator states should be published on the NEXT loop iteration,
-        // after mqttClient.loop() has run. PubSubClient uses a single internal buffer —
-        // calling publish() twice in one function corrupts the session and causes the
-        // next loop() to disconnect, which is the "one publish then silence" bug.
-        if (pendingActuators.length() > 0) {
+        // Deferred actuator publish — after mqttClient.loop() has flushed the
+        // sensor publish buffer. Signal via actuatorsReadyToSend (core 0 only,
+        // no mutex needed) so the next loop iteration publishes it.
+        if (hasActuators) {
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
             actuatorsReadyToSend = true;
+            xSemaphoreGive(dataMutex);
         }
     } else {
         publishFailCount++;
@@ -551,13 +609,60 @@ void publishSensorData()
         if (publishFailCount >= MQTT_PUBLISH_FAIL_MAX) {
             wsLogln(F("[MQTT] Forcing disconnect — dead socket detected"));
             mqttClient.disconnect();
-            secureClient.stop();        // fully tear down the TCP socket
-            // Set lastMqttReconnectMs so reconnectMQTT() waits MQTT_SOCKET_COOLDOWN_MS
-            // before opening a new socket. This gives Railway's proxy time to clear
-            // the old connection from TIME_WAIT, preventing TCP_INVALID_SYN on reconnect.
+            secureClient.stop();
             lastMqttReconnectMs = millis() - MQTT_RECONNECT_MS + MQTT_SOCKET_COOLDOWN_MS;
             publishFailCount = 0;
         }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Serial task — core 1
+//  Reads Mega serial RX continuously, assembles lines, calls parseMegaLine().
+//  Never calls mqttClient. Never does serial TX.
+// ═════════════════════════════════════════════════════════════════════════════
+void serialTask(void* /*param*/)
+{
+    static size_t   rxPeak        = 0;
+    static uint32_t lastPeakLogMs = 0;
+
+    for (;;) {
+        uint32_t now = millis();
+
+        size_t avail = MegaSerial.available();
+        if (avail > rxPeak) rxPeak = avail;
+
+        if ((now - lastPeakLogMs) >= 30000) {
+            lastPeakLogMs = now;
+            wsLogf("[Serial] RX peak in last 30s: %u bytes (buf 1024)\n", rxPeak);
+            rxPeak = 0;
+        }
+
+        while (MegaSerial.available()) {
+            char c = (char)MegaSerial.read();
+            if (c == '\r') continue;
+            if (c == '\n') {
+                if (megaLineLen > 0) {
+                    megaLineBuf[megaLineLen] = '\0';
+                    parseMegaLine(String(megaLineBuf));
+                    megaLineLen = 0;
+                }
+            } else {
+                if (megaLineLen < sizeof(megaLineBuf) - 1) {
+                    megaLineBuf[megaLineLen++] = c;
+                } else {
+                    megaLineBuf[sizeof(megaLineBuf) - 1] = '\0';
+                    char msg[80];
+                    snprintf(msg, sizeof(msg), "RX line overflow: %.40s...", megaLineBuf);
+                    // Can't call mqttLog from core 1 — wsLogf only.
+                    wsLogf("[SERIAL] WARN: %s\n", msg);
+                    megaLineLen = 0;
+                }
+            }
+        }
+
+        // Yield to avoid starving other core 1 tasks (watchdog).
+        vTaskDelay(1 / portTICK_PERIOD_MS);
     }
 }
 
@@ -573,30 +678,24 @@ void setup()
     Serial.println(F("  Booting..."));
     Serial.println(F("=========================================================="));
 
-    // Serial2 link to Arduino Mega.
-    // setRxBufferSize must be called before begin(). 1024 bytes = ~89ms at
-    // 115200 baud — enough headroom for a full telemetry frame (~390 bytes,
-    // ~34ms) while mqttClient.loop() runs TLS I/O, which can exceed 22ms
-    // (the 256-byte default buffer's capacity), causing bytes to be silently
-    // dropped and producing corrupted sensor lines on the ESP32 side.
+    // Create mutex before starting any tasks or initialising MQTT.
+    dataMutex = xSemaphoreCreateMutex();
+    configASSERT(dataMutex);
+
     MegaSerial.setRxBufferSize(1024);
     MegaSerial.begin(MEGA_BAUD_RATE, SERIAL_8N1, MEGA_RX_PIN, MEGA_TX_PIN);
     Serial.println(F("[Init] Serial2 (Mega link) started, RX buffer 1024 bytes"));
 
-    // WiFi
     connectWiFi();
 
-    // TLS — skip cert verification (acceptable for thesis prototype)
     secureClient.setInsecure();
 
-    // MQTT
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
     mqttClient.setCallback(onMqttMessage);
-    mqttClient.setBufferSize(1024);  // bumped from 512 — raw sensor fields added ~400 bytes to the payload
+    mqttClient.setBufferSize(1024);
     mqttClient.setKeepAlive(MQTT_KEEPALIVE_S);
     reconnectMQTT();
 
-    // OTA
     ArduinoOTA.setHostname(OTA_HOSTNAME);
     ArduinoOTA.setMdnsEnabled(false);
     ArduinoOTA.onStart([]() {
@@ -615,12 +714,29 @@ void setup()
     ArduinoOTA.begin();
     wsLogln(F("[Init] OTA ready — hostname: " OTA_HOSTNAME));
 
-    // WebSerial
     WebSerial.begin(&wsServer);
     wsServer.begin();
     Serial.print(F("[Init] WebSerial at http://"));
     Serial.print(WiFi.localIP());
     Serial.println(F("/webserial"));
+
+    // Pin serial task to core 1, stack 4096 bytes, priority 1.
+    // MQTT loop (Arduino loop()) runs on core 1 by default in Arduino framework,
+    // but we pin it to core 0 via the task below and leave loop() as the idle
+    // fallback. Alternatively we simply let loop() run on whichever core Arduino
+    // assigns (core 1) and pin serialTask to core 0 — but keeping MQTT on core 0
+    // matches ESP32 convention (core 0 = protocol stack, core 1 = app).
+    // Here: serialTask on core 0, loop() stays on core 1 (Arduino default).
+    // This keeps the MQTT/network stack on core 0 where WiFi runs.
+    xTaskCreatePinnedToCore(
+        serialTask,
+        "serialTask",
+        4096,
+        nullptr,
+        1,           // priority 1 — same as loop(), yields every 1ms
+        nullptr,
+        0            // core 0
+    );
 
     wsLogln(F("=========================================================="));
     wsLogln(F("  ESP32 Ready"));
@@ -629,7 +745,9 @@ void setup()
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  LOOP
+//  LOOP — runs on core 1 (Arduino framework default)
+//  Owns all mqttClient calls, serial TX, and OTA.
+//  serialTask runs on core 0 and owns serial RX.
 // ═════════════════════════════════════════════════════════════════════════════
 void loop()
 {
@@ -650,76 +768,47 @@ void loop()
         mqttLog("WARN", "NETWORK", "MQTT disconnected");
         reconnectMQTT();
     }
+
+    // ── 2b. Drain ACK queue (ACKs + logs queued by serialTask on core 0) ─────
+    drainAckQueue();
+
+    // ── 2c. Drain incoming command queue → Mega serial TX ────────────────────
     drainCommandQueue();
-    megaLineLen = 0; // drain window consumed bytes mid-stream; discard any partial line
 
-    // ── 2b. Deferred actuator publish — one loop after sensor publish ────────
-    // Must run after mqttClient.loop() so PubSubClient's internal buffer is fully
-    // flushed from the previous sensor publish before we write into it again.
-    if (actuatorsReadyToSend && mqttClient.connected()) {
-        mqttClient.publish("rainwater/actuators", pendingActuators.c_str(), false);
-        pendingActuators = "";
-        actuatorsReadyToSend = false;
-    }
-
-    // ── 3. Read sensor lines from Mega ───────────────────────────────────────
-    // Char-by-char with static buffer — avoids readStringUntil('\n') which
-    // blocks up to setTimeout() ms mid-line, splitting long lines like
-    // S,ACTUATORS across two reads and corrupting the next key in sensorDoc.
+    // ── 2d. Deferred actuator publish ────────────────────────────────────────
     {
-        // Track RX buffer peak so we can spot buffer-pressure trends.
-        static size_t   rxPeak        = 0;
-        static uint32_t lastPeakLogMs = 0;
+        bool shouldSend = false;
+        String actuatorsSnapshot = "";
 
-        size_t avail = MegaSerial.available();
-        if (avail > rxPeak) rxPeak = avail;
-
-        // Log peak every 30 s so the WebSerial monitor shows buffer headroom
-        // without flooding the log. Harmless when the buffer never fills.
-        if ((now - lastPeakLogMs) >= 30000) {
-            lastPeakLogMs = now;
-            wsLogf("[Serial] RX peak in last 30s: %u bytes (buf 1024)\n", rxPeak);
-            rxPeak = 0;
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        if (actuatorsReadyToSend) {
+            shouldSend           = true;
+            actuatorsSnapshot    = pendingActuators;
+            actuatorsReadyToSend = false;
+            pendingActuators     = "";
         }
+        xSemaphoreGive(dataMutex);
+        // Mutex released before publish.
 
-        while (MegaSerial.available()) {
-            char c = (char)MegaSerial.read();
-            if (c == '\r') continue;
-            if (c == '\n') {
-                if (megaLineLen > 0) {
-                    megaLineBuf[megaLineLen] = '\0';
-                    parseMegaLine(String(megaLineBuf));
-                    megaLineLen = 0;
-                }
-            } else {
-                if (megaLineLen < sizeof(megaLineBuf) - 1) {
-                    megaLineBuf[megaLineLen++] = c;
-                } else {
-                    // Software line buffer full — the received line is longer
-                    // than 127 chars, which should never happen with the current
-                    // Mega protocol. Log once per occurrence so it surfaces in
-                    // the dashboard activity log.
-                    megaLineBuf[sizeof(megaLineBuf) - 1] = '\0';
-                    char msg[80];
-                    snprintf(msg, sizeof(msg), "RX line overflow, discarding: %.40s...", megaLineBuf);
-                    mqttLog("WARN", "SERIAL", msg);
-                    megaLineLen = 0;
-                }
-            }
+        if (shouldSend && mqttClient.connected()) {
+            mqttClient.publish("rainwater/actuators", actuatorsSnapshot.c_str(), false);
         }
     }
 
-    // ── 4. Publish sensor data ───────────────────────────────────────────────
-    // Publish as soon as STATE arrives (sensorDataReady=true) rather than on a
-    // fixed timer. The timer was causing frames to be overwritten before publish
-    // when the 1s poll fired after the next Mega frame had already started filling
-    // sensorDoc. Rate-limit to POST_INTERVAL_MS to avoid flooding the broker.
-    if (sensorDataReady && (now - lastPostMs) >= POST_INTERVAL_MS) {
-        lastPostMs = now;
-        publishSensorData();
+    // ── 3. Publish sensor data ───────────────────────────────────────────────
+    {
+        bool ready = false;
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        ready = sensorDataReady;
+        xSemaphoreGive(dataMutex);
+
+        if (ready && (now - lastPostMs) >= POST_INTERVAL_MS) {
+            lastPostMs = now;
+            publishSensorData();
+        }
     }
 
-    // ── 5. Heartbeat — lets the dashboard know the ESP32 is alive ────────────
+    // ── 4. Heartbeat ─────────────────────────────────────────────────────────
     if ((now - lastHeartbeatMs) >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatMs = now;
         publishHeartbeat();
