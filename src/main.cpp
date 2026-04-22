@@ -170,8 +170,15 @@ struct QueuedAck {
 static QueuedAck ackQueue[ACK_QUEUE_SIZE];
 static uint8_t   ackQueueLen = 0;
 
-// ── Incoming command queue — written by MQTT callback (core 0), drained by core 0
-// No mutex needed — both sides run on core 0.
+// ── Serial RX ownership flag ──────────────────────────────────────────────────
+// drainCommandQueue() (core 1) needs exclusive MegaSerial.read() access during
+// its 200ms ACK window. serialTask (core 0) checks this flag and yields while
+// it is set. Written only by core 1, read by core 0 — volatile is sufficient
+// (no mutex needed; single writer, single reader, bool write is atomic on ESP32).
+static volatile bool serialDraining = false;
+
+// ── Incoming command queue — written by MQTT callback (core 1), drained by core 1
+// No mutex needed — both sides run on core 1.
 #define CMD_QUEUE_SIZE 8
 struct QueuedCmd {
     String  cmd;
@@ -452,9 +459,8 @@ void drainCommandQueue()
     }
 
     // 200ms ACK drain window — collect synchronous ACKs from Mega.
-    // Bytes read here are consumed from the hardware FIFO directly and will
-    // NOT be seen by serialTask. This is intentional — ACK lines belong to
-    // this command exchange, not to the sensor stream.
+    // serialDraining tells serialTask to yield so only this core reads MegaSerial.
+    serialDraining = true;
     char          lineBuf[128];
     uint8_t       lineLen      = 0;
     unsigned long drainUntil   = millis() + 200;
@@ -497,6 +503,8 @@ void drainCommandQueue()
             parseMegaLine(line);
         }
     }
+
+    serialDraining = false;  // release serial RX back to serialTask
 
     for (uint8_t i = acksReceived; i < count; i++) {
         const String& raw = cmdQueue[i].cmd;
@@ -627,6 +635,13 @@ void serialTask(void* /*param*/)
     static uint32_t lastPeakLogMs = 0;
 
     for (;;) {
+        // Yield while drainCommandQueue() owns MegaSerial RX.
+        // The drain window is at most 200ms — serialTask resumes immediately after.
+        if (serialDraining) {
+            vTaskDelay(1 / portTICK_PERIOD_MS);
+            continue;
+        }
+
         uint32_t now = millis();
 
         size_t avail = MegaSerial.available();
