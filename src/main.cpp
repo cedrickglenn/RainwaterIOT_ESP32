@@ -111,8 +111,10 @@ static QueuedAck ackQueue[ACK_QUEUE_SIZE];
 static uint8_t   ackQueueLen = 0;
 
 // ── wsLogf — safe to call from either core ───────────────────────────────────
-// Outputs to Serial + WebSerial immediately, then queues a rainwater/debug
-// publish via ackQueue (mutex-protected). drainAckQueue() publishes one per tick.
+// Outputs to Serial + WebSerial from either core.
+// MQTT publish to rainwater/debug only from core 1 (loop) — mqttClient is not thread-safe.
+// Core 0 (serialTask) gets Serial + WebSerial only; S, sensor lines are batched
+// per-cycle in parseMegaLine and published as a single message on STATE.
 void wsLogf(const char* fmt, ...) {
     char buf[256];
     va_list args;
@@ -122,22 +124,13 @@ void wsLogf(const char* fmt, ...) {
     Serial.print(buf);
     WebSerial.print(buf);
 
-    // Queue for rainwater/debug — safe from either core; drainAckQueue() publishes one per tick.
-    // Guard against pre-setup calls (dataMutex is null until setup() creates it).
-    if (mqttCallbackActive || !dataMutex) return;
+    // Only publish to rainwater/debug from core 1 — mqttClient is not thread-safe.
+    if (xPortGetCoreID() != 1) return;
+    if (mqttCallbackActive) return;
     size_t len = strlen(buf);
     if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
-    if (len > 0) {
-        xSemaphoreTake(dataMutex, portMAX_DELAY);
-        if (ackQueueLen < ACK_QUEUE_SIZE) {
-            strncpy(ackQueue[ackQueueLen].topic,   "rainwater/debug",  sizeof(ackQueue[0].topic) - 1);
-            strncpy(ackQueue[ackQueueLen].payload, buf,                sizeof(ackQueue[0].payload) - 1);
-            ackQueue[ackQueueLen].topic[sizeof(ackQueue[0].topic) - 1]   = '\0';
-            ackQueue[ackQueueLen].payload[sizeof(ackQueue[0].payload) - 1] = '\0';
-            ackQueueLen++;
-        }
-        xSemaphoreGive(dataMutex);
-    }
+    if (len > 0 && mqttClient.connected())
+        mqttClient.publish("rainwater/debug", buf);
 }
 template<typename T>
 void wsLog(T msg) { wsLogf("%s", String(msg).c_str()); }
@@ -275,6 +268,16 @@ void parseMegaLine(const String& line)
         String value = line.substring(secondComma + 1);
         value.trim();
 
+        // Accumulate key=value pairs into a per-cycle debug buffer.
+        // Flushed as a single MQTT publish when STATE arrives (last line of each cycle).
+        // This replaces 32 individual wsLogf() calls (one per key) with one publish per cycle,
+        // preventing the MQTT burst that caused EMQX to batch all lines with the same timestamp.
+        static String megaDebugBuf = "";
+
+        // Always output per-line to Serial + WebSerial for local visibility.
+        Serial.print(F("[Mega] ")); Serial.print(key); Serial.print(F(" = ")); Serial.println(value);
+        WebSerial.print(F("[Mega] ")); WebSerial.print(key); WebSerial.print(F(" = ")); WebSerial.println(value);
+
         // Take mutex only for the shared state write — release immediately after.
         xSemaphoreTake(dataMutex, portMAX_DELAY);
         if (key == "STATE") {
@@ -291,7 +294,17 @@ void parseMegaLine(const String& line)
         }
         xSemaphoreGive(dataMutex);
 
-        wsLogf("[Mega] %s = %s\n", key.c_str(), value.c_str());
+        if (key == "STATE") {
+            // STATE is always the last line of the Mega telemetry cycle (comms.cpp).
+            // Flush the accumulated debug buffer as one MQTT publish from core 1 only.
+            megaDebugBuf += "[Mega] STATE=" + value;
+            if (xPortGetCoreID() == 1 && !mqttCallbackActive && mqttClient.connected()) {
+                mqttClient.publish("rainwater/debug", megaDebugBuf.c_str());
+            }
+            megaDebugBuf = "";
+        } else {
+            megaDebugBuf += "[Mega] " + key + "=" + value + "\n";
+        }
         return;
     }
 
