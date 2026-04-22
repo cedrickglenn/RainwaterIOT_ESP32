@@ -167,7 +167,7 @@ unsigned long    lastMqttReconnectMs = 0;
 HardwareSerial MegaSerial(2);   // UART2 — GPIO16 (RX), GPIO17 (TX)
 
 // ── Shared sensor state — protected by dataMutex ─────────────────────────────
-StaticJsonDocument<1024> sensorDoc;
+StaticJsonDocument<3072> sensorDoc;
 bool   sensorDataReady      = false;
 String pendingActuators     = "";
 bool   actuatorsReadyToSend = false;
@@ -618,7 +618,7 @@ void reconnectMQTT()
 void publishSensorData()
 {
     // Snapshot shared state under lock.
-    char   body[1024];
+    char   body[3072];
     bool   hasActuators     = false;
     String actuatorsSnapshot = "";
 
@@ -749,7 +749,7 @@ void setup()
 
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
     mqttClient.setCallback(onMqttMessage);
-    mqttClient.setBufferSize(1024);
+    mqttClient.setBufferSize(3072);
     mqttClient.setKeepAlive(MQTT_KEEPALIVE_S);
     reconnectMQTT();
 
