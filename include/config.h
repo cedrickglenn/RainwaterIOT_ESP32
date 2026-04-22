@@ -30,7 +30,7 @@
 #define HEARTBEAT_INTERVAL_MS  30000   // POST /api/heartbeat every 30s
 #define WIFI_RETRY_DELAY_MS     500    // Delay between WiFi connection retries
 #define MQTT_RECONNECT_MS      5000    // Min interval between MQTT reconnect attempts
-#define MQTT_KEEPALIVE_S         60    // MQTT keep-alive interval in seconds — EMQX recommends 30–250s
+#define MQTT_KEEPALIVE_S         30    // MQTT keep-alive interval in seconds — EMQX recommends 30–250s; 30s sends PINGREQ more often, preventing EMQX from closing idle sessions
 #define MQTT_PUBLISH_FAIL_MAX     3    // Force reconnect after this many consecutive publish failures
 #define MQTT_SOCKET_COOLDOWN_MS 8000   // Wait after secureClient.stop() before reconnecting — lets Railway's proxy clear TIME_WAIT
 #define MQTT_RECONNECT_FAIL_MAX   5    // Force WiFi reconnect after this many consecutive MQTT connect() failures

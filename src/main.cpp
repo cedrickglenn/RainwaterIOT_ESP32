@@ -420,21 +420,30 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length)
 // ═════════════════════════════════════════════════════════════════════════════
 void drainAckQueue()
 {
-    // Snapshot under lock — copy out so we don't hold mutex during publish.
-    QueuedAck  snapshot[ACK_QUEUE_SIZE];
-    uint8_t    count = 0;
+    // Publish ONE item per loop() tick so each message gets its own mqttClient.loop()
+    // flush on the next iteration. Publishing all items in a tight loop sends them as
+    // a single TCP burst; EMQX batches that burst and delivers it to subscribers at
+    // once, causing serial-monitor log lines to appear with identical timestamps.
+    // One-per-tick spreads messages across individual TCP frames at ~1 ms apart.
+    if (!mqttClient.connected()) return;
+
+    QueuedAck item;
+    bool      hasItem = false;
 
     xSemaphoreTake(dataMutex, portMAX_DELAY);
-    count       = ackQueueLen;
-    memcpy(snapshot, ackQueue, sizeof(QueuedAck) * count);
-    ackQueueLen = 0;
+    if (ackQueueLen > 0) {
+        item = ackQueue[0];
+        for (uint8_t i = 1; i < ackQueueLen; i++) {
+            ackQueue[i - 1] = ackQueue[i];
+        }
+        ackQueueLen--;
+        hasItem = true;
+    }
     xSemaphoreGive(dataMutex);
     // Mutex released — safe to call mqttClient now.
 
-    if (!mqttClient.connected()) return;
-
-    for (uint8_t i = 0; i < count; i++) {
-        mqttClient.publish(snapshot[i].topic, snapshot[i].payload, false);
+    if (hasItem) {
+        mqttClient.publish(item.topic, item.payload, false);
     }
 }
 
