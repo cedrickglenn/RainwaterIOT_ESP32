@@ -6,10 +6,10 @@
 #define WIFI_PASSWORD   "K4QQ6DXr"
 
 // ── MQTT ─────────────────────────────────────────────────────────────────────
-#define MQTT_BROKER     "jb166161.ala.asia-southeast1.emqxsl.com"   // ← replace
+#define MQTT_BROKER     "jb166161.ala.asia-southeast1.emqxsl.com"
 #define MQTT_PORT       8883
-#define MQTT_USER       "rainwaterIOT"                      // ← replace
-#define MQTT_PASSWORD   "6O3`$G£)1Vg6"                      // ← replace
+#define MQTT_USER       "rainwaterIOT"
+#define MQTT_PASSWORD   "6O3`$G£)1Vg6"
 #define MQTT_CLIENT_ID      "rainwater_esp32"
 #define MQTT_TOPIC_SENSORS      "rainwater/sensors"
 #define MQTT_TOPIC_COMMANDS     "rainwater/commands"
@@ -30,7 +30,7 @@
 #define HEARTBEAT_INTERVAL_MS  30000   // POST /api/heartbeat every 30s
 #define WIFI_RETRY_DELAY_MS     500    // Delay between WiFi connection retries
 #define MQTT_RECONNECT_MS      5000    // Min interval between MQTT reconnect attempts
-#define MQTT_KEEPALIVE_S         20    // MQTT keep-alive interval in seconds (HiveMQ will ping ESP32 at 1.5× this)
+#define MQTT_KEEPALIVE_S         60    // MQTT keep-alive interval in seconds — EMQX recommends 30–250s
 #define MQTT_PUBLISH_FAIL_MAX     3    // Force reconnect after this many consecutive publish failures
 #define MQTT_SOCKET_COOLDOWN_MS 8000   // Wait after secureClient.stop() before reconnecting — lets Railway's proxy clear TIME_WAIT
 #define MQTT_RECONNECT_FAIL_MAX   5    // Force WiFi reconnect after this many consecutive MQTT connect() failures
