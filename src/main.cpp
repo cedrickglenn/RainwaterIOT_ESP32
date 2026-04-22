@@ -605,7 +605,6 @@ void publishSensorData()
     }
     sensorDoc["uptime_ms"] = millis();
     size_t bodyLen = serializeJson(sensorDoc, body, sizeof(body));
-    wsLogf("[MQTT] Payload size: %u bytes (buffer: %u)\n", (unsigned)bodyLen, (unsigned)mqttClient.getBufferSize());
     sensorDataReady = false;
     sensorDoc.clear();
     if (pendingActuators.length() > 0) {
@@ -613,7 +612,8 @@ void publishSensorData()
         actuatorsSnapshot = pendingActuators;
     }
     xSemaphoreGive(dataMutex);
-    // Mutex released — safe to call mqttClient now.
+    // Mutex released — safe to call wsLogf (takes dataMutex internally) and mqttClient now.
+    wsLogf("[MQTT] Payload size: %u bytes (buffer: %u)\n", (unsigned)bodyLen, (unsigned)mqttClient.getBufferSize());
 
     if (!mqttClient.connected()) return;
 
