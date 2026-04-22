@@ -102,10 +102,10 @@ static uint8_t megaLineLen = 0;
 // Core 1 pushes ACKs here instead of calling mqttClient.publish() directly.
 // Core 0 drains this queue after mqttClient.loop() returns.
 // Protected by dataMutex.
-#define ACK_QUEUE_SIZE 32
+#define ACK_QUEUE_SIZE 8
 struct QueuedAck {
     char    topic[64];
-    char    payload[128];
+    char    payload[768];  // large enough for one full Mega telemetry cycle batch (~640 bytes)
 };
 static QueuedAck ackQueue[ACK_QUEUE_SIZE];
 static uint8_t   ackQueueLen = 0;
@@ -296,11 +296,18 @@ void parseMegaLine(const String& line)
 
         if (key == "STATE") {
             // STATE is always the last line of the Mega telemetry cycle (comms.cpp).
-            // Flush the accumulated debug buffer as one MQTT publish from core 1 only.
+            // Push the accumulated debug buffer as one queue item — Core 1 publishes it
+            // via drainAckQueue(). One item per 2s cycle keeps the queue clear.
             megaDebugBuf += "[Mega] STATE=" + value;
-            if (xPortGetCoreID() == 1 && !mqttCallbackActive && mqttClient.connected()) {
-                mqttClient.publish("rainwater/debug", megaDebugBuf.c_str());
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            if (ackQueueLen < ACK_QUEUE_SIZE) {
+                strncpy(ackQueue[ackQueueLen].topic,   "rainwater/debug",        sizeof(ackQueue[0].topic) - 1);
+                strncpy(ackQueue[ackQueueLen].payload, megaDebugBuf.c_str(),     sizeof(ackQueue[0].payload) - 1);
+                ackQueue[ackQueueLen].topic[sizeof(ackQueue[0].topic) - 1]   = '\0';
+                ackQueue[ackQueueLen].payload[sizeof(ackQueue[0].payload) - 1] = '\0';
+                ackQueueLen++;
             }
+            xSemaphoreGive(dataMutex);
             megaDebugBuf = "";
         } else {
             megaDebugBuf += "[Mega] " + key + "=" + value + "\n";
