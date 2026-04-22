@@ -282,7 +282,9 @@ void parseMegaLine(const String& line)
         }
         xSemaphoreGive(dataMutex);
 
-        wsLogf("[Mega] %s = %s\n", key.c_str(), value.c_str());
+        // Do not publish individual S, key-value pairs to rainwater/debug —
+        // 18+ lines per telemetry cycle floods the queue and the serial monitor.
+        // The data is already collected into sensorDoc and published via publishSensorData().
         return;
     }
 
