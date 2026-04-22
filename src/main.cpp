@@ -123,9 +123,8 @@ void wsLogf(const char* fmt, ...) {
     WebSerial.print(buf);
 
     // Queue for rainwater/debug — safe from either core; drainAckQueue() publishes one per tick.
-    // This replaces the former direct mqttClient.publish() call which bypassed the queue and
-    // caused EMQX to receive all wsLogf lines as a single TCP burst (same-timestamp burst in serial monitor).
-    if (mqttCallbackActive) return;
+    // Guard against pre-setup calls (dataMutex is null until setup() creates it).
+    if (mqttCallbackActive || !dataMutex) return;
     size_t len = strlen(buf);
     if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
     if (len > 0) {
