@@ -98,6 +98,18 @@ static SemaphoreHandle_t dataMutex = nullptr;
 static char    megaLineBuf[128];
 static uint8_t megaLineLen = 0;
 
+// ── ACK queue — written by core 1 (parseMegaLine), drained by core 0 ─────────
+// Core 1 pushes ACKs here instead of calling mqttClient.publish() directly.
+// Core 0 drains this queue after mqttClient.loop() returns.
+// Protected by dataMutex.
+#define ACK_QUEUE_SIZE 32
+struct QueuedAck {
+    char    topic[64];
+    char    payload[128];
+};
+static QueuedAck ackQueue[ACK_QUEUE_SIZE];
+static uint8_t   ackQueueLen = 0;
+
 // ── wsLogf — safe to call from either core ───────────────────────────────────
 // Outputs to Serial + WebSerial immediately, then queues a rainwater/debug
 // publish via ackQueue (mutex-protected). drainAckQueue() publishes one per tick.
@@ -167,18 +179,6 @@ StaticJsonDocument<1024> sensorDoc;
 bool   sensorDataReady      = false;
 String pendingActuators     = "";
 bool   actuatorsReadyToSend = false;
-
-// ── ACK queue — written by core 1 (parseMegaLine), drained by core 0 ─────────
-// Core 1 pushes ACKs here instead of calling mqttClient.publish() directly.
-// Core 0 drains this queue after mqttClient.loop() returns.
-// Protected by dataMutex.
-#define ACK_QUEUE_SIZE 32
-struct QueuedAck {
-    char    topic[64];
-    char    payload[128];
-};
-static QueuedAck ackQueue[ACK_QUEUE_SIZE];
-static uint8_t   ackQueueLen = 0;
 
 // ── Serial RX ownership flag ──────────────────────────────────────────────────
 // drainCommandQueue() (core 1) needs exclusive MegaSerial.read() access during
