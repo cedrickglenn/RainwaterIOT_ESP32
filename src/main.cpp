@@ -584,7 +584,8 @@ void reconnectMQTT()
     lastMqttReconnectMs = millis();
 
     wsLogf("[MQTT] Connecting to %s...\n", MQTT_BROKER);
-    if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
+    if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD,
+                           nullptr, 0, false, nullptr, true)) {  // cleanSession=true — discard broker-queued commands on reconnect
         wsLogln(F("[MQTT] Connected"));
         reconnectFailCount = 0;
         mqttClient.subscribe(MQTT_TOPIC_COMMANDS);
