@@ -49,7 +49,7 @@
  *      S,TEMP_C5,28.3
  *      S,PH_C5,7.21
  *      S,TURB_C5,2.4
- *      S,STATE,0,1,0     ← first_flush_state, filter_mode, backwash_state
+ *      S,STATE,0,1,0,0   ← first_flush_state, filter_mode, backwash_state, cal_mode
  *
  *  PROTOCOL (ESP32 → Mega over Serial2):
  *    Each line is:  "C,<COMMAND>,<PARAM>\n"
@@ -284,8 +284,10 @@ void parseMegaLine(const String& line)
             sensorDoc["ff_state"]       = value.substring(0, value.indexOf(',')).toInt();
             int s2 = value.indexOf(',') + 1;
             int s3 = value.indexOf(',', s2);
+            int s4 = value.indexOf(',', s3 + 1);
             sensorDoc["filter_mode"]    = value.substring(s2, s3).toInt();
-            sensorDoc["backwash_state"] = value.substring(s3 + 1).toInt();
+            sensorDoc["backwash_state"] = value.substring(s3 + 1, s4 < 0 ? value.length() : s4).toInt();
+            if (s4 >= 0) sensorDoc["cal_mode"] = value.substring(s4 + 1).toInt();
             sensorDataReady = true;
         } else if (key == "ACTUATORS") {
             pendingActuators = value;
