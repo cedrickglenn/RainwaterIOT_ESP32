@@ -313,6 +313,19 @@ void parseMegaLine(const String& line)
             }
             xSemaphoreGive(dataMutex);
             megaDebugBuf = "";
+        } else if (key == "ACTUATORS") {
+            // Push an immediate publish to rainwater/actuators so overflow-triggered
+            // stops reach the dashboard right away, not after the next STATE (2s delay).
+            // Same pattern as the STATE/debug push above: take mutex → enqueue → release.
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            if (ackQueueLen < ACK_QUEUE_SIZE) {
+                strncpy(ackQueue[ackQueueLen].topic,   "rainwater/actuators",    sizeof(ackQueue[0].topic) - 1);
+                strncpy(ackQueue[ackQueueLen].payload, value.c_str(),            sizeof(ackQueue[0].payload) - 1);
+                ackQueue[ackQueueLen].topic[sizeof(ackQueue[0].topic) - 1]   = '\0';
+                ackQueue[ackQueueLen].payload[sizeof(ackQueue[0].payload) - 1] = '\0';
+                ackQueueLen++;
+            }
+            xSemaphoreGive(dataMutex);
         } else {
             // Pipe-separated: "MEGA|KEY=VALUE|KEY=VALUE|..."
             if (megaDebugBuf.length() == 0) megaDebugBuf = "MEGA";
