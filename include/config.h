@@ -6,7 +6,7 @@
 #define WIFI_PASSWORD   "K4QQ6DXr"
 
 // ── MQTT ─────────────────────────────────────────────────────────────────────
-#define MQTT_BROKER     "jb166161.ala.asia-southeast1.emqxsl.com"
+#define MQTT_BROKER     "c1f6cd90.ala.asia-southeast1.emqxsl.com"
 #define MQTT_PORT       8883
 #define MQTT_USER       "rainwaterIOT"
 #define MQTT_PASSWORD   "6O3`$G£)1Vg6"
