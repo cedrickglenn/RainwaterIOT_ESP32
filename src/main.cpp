@@ -600,7 +600,7 @@ void reconnectMQTT()
 
     wsLogf("[MQTT] Connecting to %s...\n", MQTT_BROKER);
     if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD,
-                           nullptr, 0, false, nullptr, true)) {  // cleanSession=true — discard broker-queued commands on reconnect
+                           nullptr, 0, false, nullptr, false)) {  // cleanSession=false — broker queues QoS1 commands while device is offline
         wsLogln(F("[MQTT] Connected"));
         reconnectFailCount = 0;
         mqttClient.subscribe(MQTT_TOPIC_COMMANDS);
