@@ -491,7 +491,7 @@ void drainAckQueue()
     // Mutex released — safe to call mqttClient now.
 
     if (hasItem) {
-        mqttClient.publish(item.topic, item.payload, false, 1);  // QoS 1
+        mqttClient.publish(item.topic, item.payload, false);
     }
 }
 
@@ -551,7 +551,7 @@ void drainCommandQueue()
                                    ? MQTT_TOPIC_CAL_ACKS
                                    : MQTT_TOPIC_ACKS;
             if (mqttClient.connected())
-                mqttClient.publish(ackTopic, line.c_str(), false, 1);  // QoS 1 — broker must confirm receipt
+                mqttClient.publish(ackTopic, line.c_str());
             acksReceived++;
         } else {
             // Non-ACK line received during drain window — parse it normally.
